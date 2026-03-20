@@ -1,0 +1,22 @@
+{
+  "threshold": 8.0,
+  "max_rounds": 10,
+  "models": {
+    "generator": "claude-code-cli",
+    "critic": "codex-cli",
+    "verifier": "gemini-api",
+    "synthesizer": "claude-code-cli"
+  },
+  "scoring": {
+    "categories": ["accuracy", "completeness", "edge_cases", "practicality"],
+    "weights": [0.3, 0.25, 0.2, 0.25]
+  },
+  "cli": {
+    "claude_code": "claude",
+    "codex": "codex"
+  },
+  "gemini": {
+    "model": "gemini-2.0-flash",
+    "api_key_env": "GEMINI_API_KEY"
+  }
+}
