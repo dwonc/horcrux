@@ -78,13 +78,14 @@ Produce improved COMPLETE solution addressing every issue.
 Reply JSON only:
 {{"solution":"<complete improved solution>","approach":"<1 sentence>","fixed":["issue1->fix","issue2->fix"],"remaining":["concern1"]}}"""
 
-SPLIT_PROMPT = """Split into {num_parts} parallel parts.
+SPLIT_PROMPT = """You are a task splitter. Do NOT read or analyze any files. Ignore the current directory.
+Split the following task into {num_parts} parallel implementation parts.
 
 Task: {task}
 {extra_context}
 
-Reply JSON only (VERY SHORT descriptions):
-{{"project_name":"<n>","shared_spec":{{"interfaces":"<1 line>","notes":"<1 line>"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences max>"}}]}}"""
+Reply with JSON only. No markdown, no explanation, just the JSON object:
+{{"project_name":"<name>","shared_spec":{{"interfaces":"<1 line>","notes":"<1 line>"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences max>"}}]}}"""
 
 SPLIT_PROMPT_WITH_ARTIFACT = """Split into {num_parts} parallel parts.
 
@@ -99,7 +100,9 @@ Remaining concerns: {remaining_concerns}
 Reply JSON only:
 {{"project_name":"<n>","shared_spec":{{"interfaces":"<1 line>","constraints":"<1 line>"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences max>"}}]}}"""
 
-PART_PROMPT = """You are an expert developer. Build this part of a larger project.
+PART_PROMPT = """You are an expert developer. Write NEW code from scratch.
+Do NOT read, reference, or check any existing files. Ignore the filesystem entirely.
+Generate the complete implementation directly in the JSON response.
 
 Overall task: {task}
 Your part: {part_title}
@@ -110,7 +113,8 @@ Shared spec:
 
 {extra_context}
 
-Write production-quality, complete code. Reply JSON only:
+Write production-quality, complete code. The `code` field must contain the FULL source code, not a placeholder.
+Reply JSON only:
 {{"files":[{{"path":"<file path>","code":"<complete code>"}}],"setup":"<install/run instructions>","notes":"<integration notes>"}}"""
 
 SELF_IMPROVE_PROMPT = """Previous attempt:
@@ -238,36 +242,57 @@ def extract_debate_artifact(state: dict) -> dict:
     return artifact
 
 
-# ═══════════════════════════════════════════
-# Phase 1: AI CALLERS (shell=False + stdin, temp file 제거)
-# ═══════════════════════════════════════════
-
-# OS별 CLI 경로 자동 감지
+# ===============================================
+# Phase 1: AI CALLERS v8 — 타임아웃/프롬프트 크기 완전 해결
+# ===============================================
+# 수정사항:
+# 1. Claude: -p 인자 방식으로 통일 (stdin 혼용 버그 제거 — 폴더 감지 무한대기 원인)
+# 2. --dangerously-skip-permissions: 폴더 권한 프롬프트 차단
+# 3. 프롬프트 자동 truncation (12000자 초과 시 압축)
+# 4. 타임아웃 시 6000자로 줄여서 1회 재시도
+# 5. 기본 timeout 600 → 300으로 단축
+# ===============================================
 import platform
 import shutil
 
-def _resolve_cmd(name, win_args, mac_args):
-    """Windows: npm 절대경로 .cmd / Mac·Linux: PATH에서 찾기"""
-    if platform.system() == "Windows":
-        npm = r"C:\Users\User\AppData\Roaming\npm"
-        return ["cmd", "/c", f"{npm}\\{name}.cmd"] + win_args
-    else:
-        # Mac/Linux: shutil.which로 PATH 탐색, 없으면 이름 그대로
-        path = shutil.which(name) or name
-        return [path] + mac_args
+_NPM = r"C:\Users\User\AppData\Roaming\npm"
+MAX_PROMPT_CHARS = 12000
+MAX_PROMPT_RETRY = 6000
 
-_CLAUDE_CMD  = _resolve_cmd("claude",  ["-p"],                        ["-p"])
-_CODEX_CMD   = _resolve_cmd("codex",   ["exec", "--skip-git-repo-check"], ["exec", "--skip-git-repo-check"])
-_GEMINI_BASE = _resolve_cmd("gemini",  [],                             [])
 
-def call_claude(prompt, timeout=600):
-    """Phase 1: shell=False, stdin 직접 전달"""
+def _truncate_prompt(prompt: str, max_chars: int) -> str:
+    """프롬프트 양끝 보존, 중간 잘라내기"""
+    if len(prompt) <= max_chars:
+        return prompt
+    keep = max_chars // 2 - 80
+    cut = len(prompt) - max_chars
+    return (
+        prompt[:keep]
+        + f"\n\n...[TRUNCATED {cut} chars to fit context]...\n\n"
+        + prompt[-keep:]
+    )
+
+
+def _win(name: str) -> str:
+    return f"{_NPM}\\{name}.cmd"
+
+
+def call_claude(prompt: str, timeout: int = 900) -> str:
+    """Claude CLI - stdin 방식. cwd=temp으로 실행해 프로젝트 파일 노출 차단."""
+    import tempfile
+    prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
+        if platform.system() == "Windows":
+            cmd = ["cmd", "/c", _win("claude"), "-p"]
+        else:
+            exe = shutil.which("claude") or "claude"
+            cmd = [exe, "-p"]
         r = subprocess.run(
-            _CLAUDE_CMD,
+            cmd,
             input=prompt,
             capture_output=True, text=True,
-            timeout=timeout, encoding="utf-8", errors="replace"
+            timeout=timeout, encoding="utf-8", errors="replace",
+            cwd=tempfile.gettempdir()  # 빈 temp 폴더에서 실행 → 프로젝트 파일 안 보임
         )
         out = r.stdout.strip()
         if r.returncode != 0 and not out:
@@ -278,113 +303,72 @@ def call_claude(prompt, timeout=600):
     except Exception as e: return f"[ERROR] Claude: {str(e)[:500]}"
 
 
-def call_codex(prompt, timeout=600):
-    """Phase 1: shell=False + stdin 직접 전달 (temp file 제거)
-    codex exec가 stdin 지원 안 할 경우 codex -p 폴백"""
+def call_codex(prompt: str, timeout: int = 600) -> str:
+    """Codex CLI - exec stdin 방식 (v7 원본 복원)"""
+    prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
+        if platform.system() == "Windows":
+            cmd = ["cmd", "/c", _win("codex"), "exec", "--skip-git-repo-check"]
+        else:
+            exe = shutil.which("codex") or "codex"
+            cmd = [exe, "exec", "--skip-git-repo-check"]
         r = subprocess.run(
-            _CODEX_CMD,
+            cmd,
             input=prompt,
             capture_output=True, text=True,
             timeout=timeout, encoding="utf-8", errors="replace"
         )
-        out = r.stdout.strip()
-        if r.returncode != 0 and not out:
-            # stdin 지원 안 하면 -p 방식으로 폴백
-            return _call_codex_fallback(prompt, timeout)
-        return out if out else _call_codex_fallback(prompt, timeout)
-    except FileNotFoundError: return "[ERROR] Codex CLI not found"
-    except subprocess.TimeoutExpired: return "[ERROR] Codex timeout"
-    except Exception as e: return f"[ERROR] Codex: {str(e)[:500]}"
-
-
-def _call_codex_fallback(prompt, timeout=600):
-    """codex stdin 미지원 시 temp file 폴백 (cross-platform)"""
-    import tempfile
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
-                                          encoding='utf-8', dir=str(LOG_DIR)) as f:
-            f.write(prompt); tmp = f.name
-        if platform.system() == "Windows":
-            npm = r"C:\Users\User\AppData\Roaming\npm"
-            cmd = f'type "{tmp}" | "{npm}\\codex.cmd" exec --skip-git-repo-check'
-        else:
-            codex_path = shutil.which("codex") or "codex"
-            cmd = f'cat "{tmp}" | "{codex_path}" exec --skip-git-repo-check'
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace", shell=True)
         out = r.stdout.strip()
         if r.returncode != 0 and not out:
             return f"[ERROR] Codex (rc={r.returncode}): {r.stderr[:500]}"
         return out if out else f"[ERROR] Codex empty: {r.stderr[:300]}"
     except subprocess.TimeoutExpired: return "[ERROR] Codex timeout"
-    except Exception as e: return f"[ERROR] Codex fallback: {str(e)[:500]}"
-    finally:
-        if tmp:
-            try: os.unlink(tmp)
-            except: pass
+    except FileNotFoundError: return "[ERROR] Codex CLI not found"
+    except Exception as e: return f"[ERROR] Codex: {str(e)[:500]}"
 
 
-def _call_gemini_with_model(prompt, model, timeout=600):
-    """Phase 1: shell=False + stdin 직접 전달 (temp file 제거), model 화이트리스트 검증"""
+def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
+    """Gemini CLI 단일 모델 호출. (out, status) 반환"""
     if model not in GEMINI_MODELS:
         return "[ERROR] Invalid Gemini model", "error"
-    try:
-        r = subprocess.run(
-            _GEMINI_BASE + ["--model", model],
-            input=prompt,
-            capture_output=True, text=True,
-            timeout=timeout, encoding="utf-8", errors="replace"
-        )
-        out = r.stdout.strip()
-        stderr = r.stderr or ""
-        if r.returncode != 0 and ("quota" in stderr.lower() or "exhausted" in stderr.lower()):
-            return None, "quota"
-        if r.returncode != 0 and not out:
-            # stdin 미지원 시 temp file 폴백
-            return _call_gemini_fallback(prompt, model, timeout)
-        return (out if out else f"[ERROR] Gemini/{model} empty"), "ok"
-    except subprocess.TimeoutExpired: return "[ERROR] Gemini timeout", "error"
-    except FileNotFoundError: return "[ERROR] Gemini CLI not found", "error"
-    except Exception as e: return f"[ERROR] Gemini: {str(e)[:500]}", "error"
+
+    prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
+
+    def _run(p: str, t: int):
+        try:
+            if platform.system() == "Windows":
+                cmd = ["cmd", "/c", _win("gemini"), "--model", model]
+            else:
+                exe = shutil.which("gemini") or "gemini"
+                cmd = [exe, "--model", model]
+            r = subprocess.run(
+                cmd, input=p, capture_output=True, text=True,
+                timeout=t, encoding="utf-8", errors="replace", shell=False
+            )
+            out = r.stdout.strip()
+            stderr = r.stderr or ""
+            if "quota" in stderr.lower() or "exhausted" in stderr.lower():
+                return None, "quota"
+            if r.returncode != 0 and not out:
+                return f"[ERROR] Gemini/{model}: {stderr[:300]}", "error"
+            return (out or f"[ERROR] Gemini/{model} empty"), "ok"
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT]", "timeout"
+        except FileNotFoundError:
+            return "[ERROR] Gemini CLI not found", "error"
+        except Exception as e:
+            return f"[ERROR] Gemini: {str(e)[:300]}", "error"
+
+    out, status = _run(prompt, timeout)
+    if status == "timeout":
+        short = _truncate_prompt(prompt, MAX_PROMPT_RETRY)
+        out, status = _run(short, timeout)
+        if status == "timeout":
+            return "[ERROR] Gemini timeout", "error"
+    return out, status
 
 
-def _call_gemini_fallback(prompt, model, timeout=600):
-    """Gemini stdin 미지원 시 temp file 폴백 (cross-platform)"""
-    import tempfile
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
-                                          encoding='utf-8', dir=str(LOG_DIR)) as f:
-            f.write(prompt); tmp = f.name
-        if platform.system() == "Windows":
-            npm = r"C:\Users\User\AppData\Roaming\npm"
-            cmd = f'type "{tmp}" | "{npm}\\gemini.cmd" --model {model}'
-        else:
-            gemini_path = shutil.which("gemini") or "gemini"
-            cmd = f'cat "{tmp}" | "{gemini_path}" --model {model}'
-        r = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace", shell=True
-        )
-        out = r.stdout.strip()
-        stderr = r.stderr or ""
-        if r.returncode != 0 and ("quota" in stderr.lower() or "exhausted" in stderr.lower()):
-            return None, "quota"
-        if r.returncode != 0 and not out:
-            return f"[ERROR] Gemini/{model}: {stderr[:500]}", "error"
-        return (out if out else f"[ERROR] Gemini/{model} empty"), "ok"
-    except subprocess.TimeoutExpired: return "[ERROR] Gemini timeout", "error"
-    except Exception as e: return f"[ERROR] Gemini: {str(e)[:500]}", "error"
-    finally:
-        if tmp:
-            try: os.unlink(tmp)
-            except: pass
-
-
-def call_gemini(prompt, timeout=600):
+def call_gemini(prompt: str, timeout: int = 300) -> str:
     global _gemini_current_model_idx
     for attempt in range(len(GEMINI_MODELS)):
         with _gemini_lock:
@@ -606,6 +590,34 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
 # ═══════════════════════════════════════════
 pairs = {}
 
+
+def _save_pair_files(results: dict, output_dir: str) -> list:
+    """
+    pair 결과에서 files 배열 파싱 → output_dir 기준으로 자동 저장.
+    """
+    base = Path(output_dir)
+    saved = []
+    for part_id, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        files = result.get("files", [])
+        if not files and "raw" in result:
+            parsed = extract_json(result["raw"])
+            if parsed:
+                files = parsed.get("files", [])
+        for f in files:
+            rel_path = f.get("path", "")
+            code     = f.get("code", "")
+            if not rel_path or not code:
+                continue
+            target = base / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(code, encoding="utf-8")
+            saved.append(str(target))
+            print(f"[pair] 저장됨: {target}")
+    return saved
+
+
 AI_CALLERS = [
     ("Claude Opus 4.6", call_claude),
     ("Codex GPT-5.4", call_codex),
@@ -647,7 +659,14 @@ def run_pair(pair_id, task, mode, extra_context="", artifact=None):
         if not split_json or "parts" not in split_json:
             state["messages"].append({"role": "architect", "model": "Claude Opus 4.6", "content": split_raw})
             state["status"] = "error"
-            state["error"] = "Failed to split task"
+            state["error"] = f"Failed to split task. Claude raw response: {split_raw[:500]}"
+            state["finished_at"] = datetime.now().isoformat()
+            # early return 시에도 로그 저장
+            try:
+                log_file = LOG_DIR / f"{pair_id}.json"
+                with open(log_file, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+            except Exception: pass
             return
 
         shared_spec = json.dumps(split_json.get("shared_spec", {}), indent=2)
@@ -696,6 +715,12 @@ def run_pair(pair_id, task, mode, extra_context="", artifact=None):
         if state.get("abort"):
             state["status"] = "aborted"; return
         state["status"] = "completed"
+
+        # ── 자동 파일 저장 ──
+        # 결과에서 files 배열 파싱 → output_dir 기준으로 저장
+        output_dir = state.get("output_dir", "")
+        if output_dir:
+            _save_pair_files(state["results"], output_dir)
 
     except Exception as e:
         state["status"] = "error"
@@ -852,19 +877,32 @@ def start_debate():
             if not task or task == parent.get("task", ""):
                 parent_task = parent.get("task", "")
                 task = task or parent_task
+    # project_dir 지정 시 프로젝트 코드를 읽어 task에 context로 첨부
+    project_dir = data.get("project_dir", "")
+    if project_dir:
+        project_code = _read_project_files(project_dir)
+        if project_code:
+            task = (
+                f"{task}\n\n"
+                f"=== 현재 프로젝트 코드 ({project_dir}) ===\n"
+                f"{project_code}\n"
+                f"=== 위 코드를 분석하여 \uace0도화 포인트를 판단하라 ==="
+            )
+
     debates[debate_id] = {
         "id": debate_id, "task": task, "status": "running",
         "round": 0, "phase": "", "messages": [], "raw_steps": [],
         "avg_score": 0, "final_solution": "",
         "error": None, "abort": False,
         "parent_debate_id": parent_id or None,
+        "project_dir": project_dir,
         "created_at": datetime.now().isoformat(), "finished_at": None,
     }
     t = threading.Thread(target=run_debate,
                          args=(debate_id, task, threshold, max_rounds, initial_solution),
                          daemon=True)
     t.start()
-    return jsonify({"debate_id": debate_id})
+    return jsonify({"debate_id": debate_id, "project_dir": project_dir})
 
 
 @app.route("/api/status/<debate_id>")
@@ -1017,6 +1055,44 @@ def test_connections():
     return jsonify(results)
 
 
+# ── Project-aware debate ──
+
+def _read_project_files(project_dir: str, max_chars: int = 8000) -> str:
+    """
+    project_dir 아래 .py 파일을 읽어서 텍스트로 반환.
+    max_chars 초과 시 파일 크기 순으로 중요도 높은 것만 포함.
+    """
+    base = Path(project_dir)
+    if not base.exists():
+        return ""
+
+    # .py 파일 수집 (테스트/캐시 제외)
+    py_files = []
+    for f in base.rglob("*.py"):
+        if any(p in f.parts for p in ["__pycache__", ".venv", "test", "tests", "migrations"]):
+            continue
+        py_files.append(f)
+
+    # 크기 순 정렬 (큰 파일 = 핵심 로직)
+    py_files.sort(key=lambda f: f.stat().st_size, reverse=True)
+
+    chunks = []
+    total = 0
+    for f in py_files:
+        try:
+            content = f.read_text(encoding="utf-8", errors="replace")
+            rel = str(f.relative_to(base))
+            entry = f"\n### {rel}\n{content}"
+            if total + len(entry) > max_chars:
+                break
+            chunks.append(entry)
+            total += len(entry)
+        except Exception:
+            continue
+
+    return "\n".join(chunks)
+
+
 # ── Pair ──
 
 @app.route("/api/pair", methods=["POST"])
@@ -1026,16 +1102,18 @@ def start_pair():
     if not task: return jsonify({"error": "task required"}), 400
     mode = data.get("mode", "pair2")
     extra_context = data.get("context", "")
+    output_dir = data.get("output_dir", "")  # 자동 파일 저장 경로
     pair_id = "pair_" + datetime.now().strftime("%Y%m%d_%H%M%S")
     pairs[pair_id] = {
         "id": pair_id, "task": task, "mode": mode, "status": "running",
         "phase": "", "messages": [], "results": {}, "spec": "",
+        "output_dir": output_dir,
         "error": None, "abort": False,
         "created_at": datetime.now().isoformat(), "finished_at": None,
     }
     t = threading.Thread(target=run_pair, args=(pair_id, task, mode, extra_context), daemon=True)
     t.start()
-    return jsonify({"pair_id": pair_id, "mode": mode})
+    return jsonify({"pair_id": pair_id, "mode": mode, "output_dir": output_dir})
 
 
 @app.route("/api/pair/status/<pair_id>")
@@ -1349,15 +1427,17 @@ function autoGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollH
 document.getElementById("taskInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();startDebate()}});
 async function testConnections(){const el=$('testResult');el.innerHTML='Testing...';try{const r=await fetch("/api/test");const d=await r.json();el.innerHTML=Object.entries(d).map(([k,v])=>{const c=v.ok?'#69db7c':'#ff6b6b';return `<div style="color:${c};margin:6px 0;padding:8px;background:${c}11;border:1px solid ${c}33;border-radius:6px"><b>${v.ok?'OK':'FAIL'} ${k} ${v.json?'JSON ok':'no JSON'}</b></div>`}).join('')}catch(e){el.innerHTML=`<span style="color:#ff6b6b">${e.message}</span>`}}
 async function loadThreads(){const r=await fetch("/api/threads");const t=await r.json();const el=$('threadList');if(!t.length){el.innerHTML='<div style="padding:20px;text-align:center;color:#444;font-size:12px">No debates yet</div>';return}el.innerHTML=t.map(t=>{const a=t.id===cid?'active':'';const sc=t.avg_score>=THRESHOLD?'#69db7c':t.avg_score>0?'#ff6b6b':'#666';const tm=t.created_at?new Date(t.created_at).toLocaleString('ko-KR',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';return `<div class="thread-item ${a}" onclick="selectThread('${t.id}')"><div class="thread-task">${esc(t.task)}</div><div class="thread-meta"><span class="thread-status ${t.status}"></span><span>${t.status}</span><span>R${t.round}</span><span class="thread-score" style="color:${sc}">${t.avg_score>0?t.avg_score.toFixed(1):'-'}</span><span style="margin-left:auto;color:#555">${tm}</span><span class="thread-delete" onclick="event.stopPropagation();deleteThread('${t.id}')">x</span></div></div>`}).join('')}
+function statusUrl(id){if(id.startsWith('pair_'))return`/api/pair/status/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/status/${id}`;if(id.startsWith('si_'))return`/api/self_improve/status/${id}`;return`/api/status/${id}`}
+function resultUrl(id){if(id.startsWith('pair_'))return`/api/pair/result/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/result/${id}`;if(id.startsWith('si_'))return`/api/self_improve/result/${id}`;return`/api/result/${id}`}
 async function selectThread(id){if(pt)clearInterval(pt);cid=id;lmc=0;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';
-  const sr=await fetch(`/api/status/${id}`);const s=await sr.json();
+  const sr=await fetch(statusUrl(id));const s=await sr.json();
   if(s.error==='not found')return;
   if(s.status==='running'){
     $('taskInput').value=s.task||'';
     run=true;$('btnRun').disabled=true;$('btnStop').style.display='inline-block';$('progressArea').style.display='block';
     pt=setInterval(poll,1500);
   } else {
-    const fr=await fetch(`/api/result/${id}`);const full=await fr.json();
+    const fr=await fetch(resultUrl(id));const full=await fr.json();
     $('taskInput').value=full.task||'';
     renderAll(full);
     run=false;$('btnRun').disabled=false;$('btnStop').style.display='none';$('progressArea').style.display='none';renderResult(full);
@@ -1369,16 +1449,16 @@ async function deleteThread(id){await fetch(`/api/delete/${id}`,{method:'DELETE'
 function newThread(){if(pt)clearInterval(pt);cid=null;lmc=0;run=false;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='flex';$('taskInput').value='';$('taskInput').focus();$('progressArea').style.display='none';$('btnRun').disabled=false;$('btnStop').style.display='none';loadThreads()}
 async function startDebate(){const task=$('taskInput').value.trim();if(!task||run)return;run=true;$('btnRun').disabled=true;$('btnStop').style.display='inline-block';$('progressArea').style.display='block';$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';lmc=0;const r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task,threshold:THRESHOLD,max_rounds:MAX_ROUNDS})});const d=await r.json();cid=d.debate_id;loadThreads();pt=setInterval(poll,1500)}
 async function poll(){if(!cid)return;
-  const r=await fetch(`/api/status/${cid}`);const s=await r.json();
-  $('progressLabel').textContent=`Round ${s.round}/${MAX_ROUNDS} - ${s.phase||'...'}`;
-  $('progressFill').style.width=Math.min((s.round/MAX_ROUNDS)*100,100)+"%";
+  const r=await fetch(statusUrl(cid));const s=await r.json();
+  $('progressLabel').textContent=`Round ${s.round||0}/${MAX_ROUNDS} - ${s.phase||'...'}`;
+  $('progressFill').style.width=Math.min(((s.round||0)/MAX_ROUNDS)*100,100)+"%";
   if(s.avg_score>0){$('progressScore').textContent=`Score: ${s.avg_score.toFixed(1)} / ${THRESHOLD}`;$('progressScore').style.color=s.avg_score>=THRESHOLD?'#69db7c':'#ff6b6b'}
   if(s.status!=='running'){
     clearInterval(pt);run=false;$('btnRun').disabled=false;$('btnStop').style.display='none';$('progressArea').style.display='none';
-    const fr=await fetch(`/api/result/${cid}`);const full=await fr.json();
+    const fr=await fetch(resultUrl(cid));const full=await fr.json();
     renderAll(full);renderResult(full);loadThreads();
   } else if(s.message_count>lmc){
-    const fr=await fetch(`/api/result/${cid}`);const full=await fr.json();
+    const fr=await fetch(resultUrl(cid));const full=await fr.json();
     const c=$('messages');const msgs=full.messages||[];
     for(let i=lmc;i<msgs.length;i++){const m=msgs[i];if(m.role==='generator'){c.innerHTML+=`<div class="round-divider">Round ${Math.floor(i/3)+1}</div>`}const ro=ROLES[m.role]||{name:m.role,cls:"generator"};let sh='';if(m.score!==undefined){const p=m.score>=THRESHOLD;sh=`<span class="score ${p?'score-pass':'score-fail'}">${m.score.toFixed(1)}/10</span>`}c.innerHTML+=`<div class="msg msg-${ro.cls}"><div class="msg-header"><span class="role-tag role-${ro.cls}">${ro.name}</span>${sh}</div><pre>${esc(m.content)}</pre></div>`}
     lmc=msgs.length;sb();

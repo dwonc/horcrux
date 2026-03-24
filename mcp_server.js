@@ -46,6 +46,8 @@ server.tool("run",
     max_rounds: z.number().optional(),
     threshold: z.number().optional(),
     parent_debate_id: z.string().optional().describe("Deep Dive: chain from a previous debate's final_solution"),
+    output_dir: z.string().optional().describe("pair2/pair3 only: 완료 시 생성된 파일을 자동 저장할 프로젝트 경로 (예: D:\\Aegis-Trader)"),
+    project_dir: z.string().optional().describe("debate/debate_pair 모드에서 프로젝트 코드를 자동으로 읽어 분석 context로 활용. (예: D:\\Aegis-Trader)"),
   },
   async (args) => {
     try {
@@ -58,9 +60,11 @@ server.tool("run",
           max_rounds: args.max_rounds || 5,
           threshold: args.threshold || 8.0,
           parent_debate_id: args.parent_debate_id || "",
+          project_dir: args.project_dir || "",
         });
         job_id = r.debate_id;
         msg = `debate_id: ${job_id}\nUse check("${job_id}") to monitor.`;
+        if (r.project_dir) msg += `\nproject_dir: ${r.project_dir} (코드 자동 읽기 활성화)`;
 
       } else if (mode.startsWith("debate_pair")) {
         const pairMode = mode.replace("debate_", ""); // pair2 or pair3
@@ -75,9 +79,14 @@ server.tool("run",
 
       } else {
         // pair2, pair3
-        r = await flask("/api/pair", "POST", { task: args.task, mode: mode });
+        r = await flask("/api/pair", "POST", {
+          task: args.task,
+          mode: mode,
+          output_dir: args.output_dir || ""
+        });
         job_id = r.pair_id;
         msg = `pair_id: ${job_id}\nUse check("${job_id}") to monitor.`;
+        if (r.output_dir) msg += `\noutput_dir: ${r.output_dir} (완료 시 자동 저장)`;
       }
 
       if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
@@ -125,9 +134,13 @@ server.tool("check",
       // pair (pair_)
       if (id.startsWith("pair_")) {
         status = await flask(`/api/pair/status/${id}`);
-        if (status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
+        // "not found" 404 vs job error 구분: id 필드 없으면 진짜 not found
+        if (!status.id && status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
         if (status.status === "running") {
           return { content: [{ type: "text", text: `pair: ${status.status} | phase: ${status.phase} | parts_done: ${status.parts_done || 0}` }] };
+        }
+        if (status.status === "error") {
+          return { content: [{ type: "text", text: `pair: ERROR\n${status.error || "unknown error"}\n\nphase: ${status.phase || "-"}` }] };
         }
         const full = await flask(`/api/pair/result/${id}`);
         let t = `## Pair ${(full.mode || "").toUpperCase()} ${full.status}\n\n`;

@@ -120,9 +120,7 @@ def api_system():
 @_srv.app.route("/dashboard")
 def dashboard():
     ui = pathlib.Path(ROOT) / "web_ui" / "index.html"
-    if ui.exists():
-        return ui.read_text(encoding="utf-8")
-    return "web_ui/index.html not found", 404
+    return "dashboard removed", 404
 
 print("[patch] all routes registered")
 
