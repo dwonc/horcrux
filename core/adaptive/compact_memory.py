@@ -272,11 +272,26 @@ class CompactMemory:
         )
         self.checkpoints.append(checkpoint)
 
+    def inject_human_directive(self, directive: str, action_type: str = "feedback"):
+        """Interactive mode: 사람의 피드백/포커스를 memory에 주입."""
+        # working memory에 보존 항목으로 추가
+        if directive not in self.working.must_not_change:
+            self.working.must_not_change.append(f"[HUMAN] {directive}")
+        # decision memory에 기록
+        if "decision" in self._active_layers:
+            self.decision.accepted.append({
+                "topic": f"human_{action_type}",
+                "choice": directive,
+                "reason": f"human directive ({action_type})",
+            })
+
     def build_revision_prompt(
         self,
         task: str,
         round_num: int,
         current_solution_truncated: str,
+        human_directive: str = "",
+        focus_constraint: str = "",
     ) -> str:
         """delta-based revision 프롬프트 생성.
 
@@ -287,6 +302,14 @@ class CompactMemory:
           - blocking issue + delta만 전달
         """
         parts = []
+
+        # Human directive (최우선)
+        if human_directive:
+            parts.append(f"[HUMAN DIRECTIVE — highest priority]\n{human_directive}")
+
+        # Focus constraint
+        if focus_constraint:
+            parts.append(f"[FOCUS CONSTRAINT]\nFocus on: {focus_constraint}\nDo NOT change areas outside this focus.")
 
         # Task (항상 포함)
         parts.append(f"Task: {task}")

@@ -2203,6 +2203,7 @@ def horcrux_run():
                 scope=data.get("scope", "medium"),
                 risk=data.get("risk", "medium"),
                 artifact_type=data.get("artifact_type", "none"),
+                interactive=data.get("interactive", "batch"),
             )
             return jsonify({
                 "status": "converged" if result.get("converged") else "completed",
@@ -2364,7 +2365,70 @@ def horcrux_stop(job_id):
     if state:
         state["status"] = "aborted"
         state["finished_at"] = datetime.now().isoformat()
+    # interactive session stop
+    i_sess = interactive_sessions.get(job_id)
+    if i_sess:
+        from core.adaptive import SessionCommand, FeedbackAction
+        i_sess.resume(SessionCommand(action=FeedbackAction.STOP))
     return jsonify({"ok": True})
+
+
+# ── Interactive Session store ──
+interactive_sessions = {}
+
+
+@app.route("/api/horcrux/feedback", methods=["POST"])
+def horcrux_feedback():
+    """Interactive session에 피드백 주입 + 다음 라운드 재개."""
+    data = request.json
+    job_id = data.get("job_id", "")
+    action = data.get("action", "continue")
+
+    i_sess = interactive_sessions.get(job_id)
+    if not i_sess:
+        return jsonify({"error": f"interactive session not found: {job_id}"}), 404
+
+    from core.adaptive import SessionCommand, FeedbackAction as FA
+
+    action_map = {
+        "continue": FA.CONTINUE, "feedback": FA.FEEDBACK,
+        "focus": FA.FOCUS, "stop": FA.STOP, "rollback": FA.ROLLBACK,
+    }
+    fa = action_map.get(action, FA.CONTINUE)
+
+    cmd = SessionCommand(
+        action=fa,
+        human_directive=data.get("human_directive", ""),
+        focus_area=data.get("focus_area", ""),
+        focus_depth=data.get("focus_depth", "deep"),
+        rollback_to_round=data.get("rollback_to_round", 0),
+        new_directive=data.get("new_directive", ""),
+    )
+
+    # rollback 시 irreversible 경고
+    if fa == FA.ROLLBACK and i_sess.side_effects.has_irreversible_after(cmd.rollback_to_round):
+        irr = i_sess.side_effects.irreversible_rounds_after(cmd.rollback_to_round)
+        return jsonify({
+            "status": "warning",
+            "irreversible_warning": f"Rounds {irr} have irreversible side effects. Send again to confirm.",
+            "irreversible_rounds": irr,
+        })
+
+    i_sess.resume(cmd)
+    return jsonify({
+        "status": i_sess.state.value,
+        "message": f"action={action} applied",
+        "next_round": i_sess.current_round + 1,
+    })
+
+
+@app.route("/api/horcrux/session/<job_id>")
+def horcrux_session(job_id):
+    """Interactive session 상세 상태."""
+    i_sess = interactive_sessions.get(job_id)
+    if not i_sess:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(i_sess.to_dict())
 
 
 # ── Analytics API routes (Phase 3) ──

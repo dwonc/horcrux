@@ -36,7 +36,9 @@ from core.adaptive import (
     REVISION_HARD_CAP,
     CompactMemory,
     should_run_aux_critics,
-    execute_fallback_chain, FallbackContext, FallbackAction,
+    execute_fallback_chain, FallbackContext, FallbackAction as AdaptiveFallbackAction,
+    InteractiveSession, SessionConfig, SessionState,
+    FeedbackAction as InteractiveFeedbackAction, SessionCommand, RoundResult,
 )
 from core.provider import (
     ProviderBackend, ProviderResponse,
@@ -95,6 +97,7 @@ def run_adaptive(
     scope: str = "small",
     risk: str = "low",
     artifact_type: str = "none",
+    interactive: str = "batch",
 ) -> dict:
     """
     Adaptive Horcrux 메인 진입점.
@@ -147,13 +150,21 @@ def run_adaptive(
     print(f"  Session: {session_id}")
     print(f"{'='*60}\n")
 
+    # ─── Step 2.5: Interactive Session (if not batch) ───
+    i_session = None
+    if interactive != "batch":
+        i_session = InteractiveSession(
+            config=SessionConfig(mode=interactive),
+            base_dir=str(LOG_DIR / "checkpoints"),
+        )
+
     # ─── Step 3: Mode-specific Execution ───
     if mode == HorcruxMode.FAST:
         result = _run_fast(task, config, session_id, stage_plan)
     elif mode == HorcruxMode.STANDARD:
-        result = _run_standard(task, config, session_id, stage_plan)
+        result = _run_standard(task, config, session_id, stage_plan, i_session=i_session)
     else:
-        result = _run_full_horcrux(task, config, session_id, stage_plan)
+        result = _run_full_horcrux(task, config, session_id, stage_plan, i_session=i_session)
 
     # ─── Finalize ───
     total_ms = (time.time() - total_start) * 1000
@@ -336,6 +347,7 @@ def _run_fast(
 
 def _run_standard(
     task: str, config: dict, session_id: str, plan: StagePlan,
+    i_session: Optional[InteractiveSession] = None,
 ) -> dict:
     """
     Standard mode: pair gen → synth → core critic → revision(max 2) → finalize
@@ -369,10 +381,14 @@ def _run_standard(
             )
         else:
             # Phase 1.5: delta-based prompting (전체 재삽입 금지)
+            hd = i_session.get_pending_directive() if i_session else None
+            fc = i_session.get_pending_focus() if i_session else None
             gen_prompt = memory.build_revision_prompt(
                 task=task,
                 round_num=round_num,
                 current_solution_truncated=_truncate(current_solution, 5000),
+                human_directive=hd or "",
+                focus_constraint=fc or "",
             )
 
         pair_timeout_ms = adaptive_cfg.timeouts.generator_ms
@@ -500,7 +516,38 @@ def _run_standard(
             round_data["converged"] = True
             history.append(round_data)
             _log_round(session_id, round_num, round_data)
+            if i_session:
+                i_session.current_round = round_num
+                i_session.rounds.append(RoundResult(
+                    round_num=round_num, final_score=critic_score,
+                    convergence_delta=critic_score - prev_score if round_num > 1 else critic_score,
+                ))
+                i_session.create_checkpoint()
             break
+
+        # ═══ Interactive Pause Point ═══
+        if i_session:
+            i_session.current_round = round_num
+            rr = RoundResult(
+                round_num=round_num, final_score=critic_score,
+                convergence_delta=critic_score - prev_score if round_num > 1 else critic_score,
+            )
+            i_session.rounds.append(rr)
+            i_session.create_checkpoint()
+
+            # semi_interactive: auto-pause 조건 체크
+            auto_reason = i_session.should_auto_pause(rr)
+            if auto_reason:
+                i_session.pause(reason=auto_reason)
+
+            if not i_session.check_pause_point(f"after_critic_round_{round_num}"):
+                print(f"    ⛔ Session cancelled")
+                break
+
+            # resume 후 human directive 반영
+            hd = i_session.get_pending_directive()
+            if hd:
+                print(f"    [HUMAN] Directive: {hd[:80]}")
 
         # ═══ Revision Decision ═══
         progress_delta = critic_score - prev_score if round_num > 1 else critic_score
@@ -548,6 +595,7 @@ def _run_standard(
 
 def _run_full_horcrux(
     task: str, config: dict, session_id: str, plan: StagePlan,
+    i_session: Optional[InteractiveSession] = None,
 ) -> dict:
     """
     Full Horcrux mode: 기존 orchestrator.run_debate() 활용.

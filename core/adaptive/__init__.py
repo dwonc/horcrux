@@ -86,6 +86,19 @@ from .fallback_chain import (
     FallbackContext,
     FALLBACK_CHAINS,
 )
+from .interactive import (
+    InteractiveSession,
+    SessionConfig,
+    SessionState,
+    AutoPauseConfig,
+    FeedbackAction,
+    SessionCommand,
+    RoundResult,
+    CheckpointStore,
+    SideEffectJournal,
+    SideEffect,
+    SideEffectType,
+)
 from .analytics import (
     compute_latency_percentiles,
     auto_tune_timeouts,
@@ -182,6 +195,18 @@ __all__ = [
     "CriticReliability",
     "build_llm_classify_prompt",
     "parse_llm_classify_response",
+    # interactive
+    "InteractiveSession",
+    "SessionConfig",
+    "SessionState",
+    "AutoPauseConfig",
+    "FeedbackAction",
+    "SessionCommand",
+    "RoundResult",
+    "CheckpointStore",
+    "SideEffectJournal",
+    "SideEffect",
+    "SideEffectType",
     # constants
     "REVISION_HARD_CAP",
 ]

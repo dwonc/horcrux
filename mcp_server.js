@@ -52,6 +52,7 @@ server.tool("run",
     audience: z.string().optional().describe("문서/PPT 타겟 독자"),
     tone: z.string().optional().describe("professional/casual/technical"),
     iterations: z.number().optional().describe("self_improve 반복 횟수"),
+    interactive: z.enum(["batch", "interactive", "semi"]).optional().describe("batch=기본, interactive=매 라운드 pause, semi=조건부 pause"),
   },
   async (args) => {
     try {
@@ -62,6 +63,7 @@ server.tool("run",
       if (args.output_dir) body.output_dir = args.output_dir;
       if (args.project_dir) body.project_dir = args.project_dir;
       if (args.audience) body.audience = args.audience;
+      if (args.interactive) body.interactive = args.interactive;
       if (args.tone) body.tone = args.tone;
       if (args.iterations) body.iterations = args.iterations;
 
@@ -329,7 +331,40 @@ server.tool("analytics",
   }
 );
 
-// ─── 5. horcrux_test: AI 연결 테스트 ───
+// ─── 5. feedback: Interactive session 피드백 ───
+server.tool("feedback",
+  "Horcrux interactive session에 피드백 주입. paused 상태에서 continue/feedback/focus/stop/rollback 가능.",
+  {
+    job_id: z.string().describe("Interactive session job ID"),
+    action: z.enum(["continue", "feedback", "focus", "stop", "rollback"]).describe("수행할 액션"),
+    message: z.string().optional().describe("feedback/focus 시 자연어 지시"),
+    rollback_to: z.number().optional().describe("rollback 시 되돌릴 라운드 번호"),
+  },
+  async (args) => {
+    try {
+      const body = { job_id: args.job_id, action: args.action };
+      if (args.message) {
+        if (args.action === "focus") body.focus_area = args.message;
+        else body.human_directive = args.message;
+      }
+      if (args.rollback_to) body.rollback_to_round = args.rollback_to;
+
+      const r = await flask("/api/horcrux/feedback", "POST", body);
+      if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
+
+      let t = `## Feedback Applied\n\n`;
+      t += `**Status:** ${r.status}\n`;
+      t += `**Message:** ${r.message || ""}\n`;
+      if (r.next_round) t += `**Next Round:** ${r.next_round}\n`;
+      if (r.irreversible_warning) t += `\n⚠️ **Warning:** ${r.irreversible_warning}\n`;
+      return { content: [{ type: "text", text: t }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "Error: " + e.message }] };
+    }
+  }
+);
+
+// ─── 6. horcrux_test: AI 연결 테스트 ───
 server.tool("horcrux_test",
   "AI 연결 테스트 (Claude, Codex)",
   {},
@@ -351,7 +386,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("MCP: horcrux v8.0 connected\n");
-  process.stderr.write("  Tools: run, check, classify, analytics, horcrux_test\n");
+  process.stderr.write("  Tools: run, check, classify, analytics, feedback, horcrux_test\n");
 }
 
 main().catch(e => { process.stderr.write("MCP fatal: " + e.stack + "\n"); process.exit(1); });
