@@ -141,6 +141,16 @@ def _get_profile(task_type: str) -> dict:
     return PROFILE_CONFIG.get(task_type, PROFILE_CONFIG["hybrid"])
 
 
+def _detect_language_instruction(task: str) -> str:
+    """task 언어를 감지해서 출력 언어 지시문 반환."""
+    # 한글 유니코드 범위: AC00-D7AF (완성형), 3131-318E (자모)
+    korean_chars = sum(1 for c in task if '\uAC00' <= c <= '\uD7AF' or '\u3131' <= c <= '\u318E')
+    ratio = korean_chars / max(len(task), 1)
+    if ratio > 0.05:  # 한글이 5% 이상이면 한국어 task
+        return "IMPORTANT: 반드시 한국어로 답변하라. All output MUST be in Korean."
+    return ""
+
+
 # ═══════════════════════════════════════════
 # PROMPTS — Content Profile (profile-aware)
 # ═══════════════════════════════════════════
@@ -697,7 +707,8 @@ def _run_content_generators(task: str, claude_model: str, state: dict,
     roles = profile["generator_roles"]
     instruction = profile["generator_instruction"]
     ctx_prefix = state.get("_project_context_prefix", "")
-    prompts = {name: ctx_prefix + CONTENT_GENERATOR_PROMPT.format(
+    lang_inst = _detect_language_instruction(task)
+    prompts = {name: ctx_prefix + (lang_inst + "\n\n" if lang_inst else "") + CONTENT_GENERATOR_PROMPT.format(
                    task=task, role=role, profile_instruction=instruction)
                for name, role in roles.items()}
 
@@ -734,7 +745,8 @@ def _run_content_generators(task: str, claude_model: str, state: dict,
 def _run_content_synthesizer(task: str, gen_results: dict, claude_model: str, state: dict) -> tuple:
     """Phase 2: Synthesize 3 outputs into 1."""
     ctx_prefix = state.get("_project_context_prefix", "")
-    prompt = ctx_prefix + SYNTH_PROMPT_V2.format(
+    lang_inst = _detect_language_instruction(task)
+    prompt = ctx_prefix + (lang_inst + "\n\n" if lang_inst else "") + SYNTH_PROMPT_V2.format(
         task=task,
         plan_a=gen_results.get("claude", {}).get("display", "N/A"),
         plan_b=gen_results.get("codex", {}).get("display", "N/A"),
@@ -788,11 +800,14 @@ def _run_content_multi_critic(task: str, content: str, previously_fixed: str,
 
     total_workers = 2 + len(available_aux)
 
+    lang_inst = _detect_language_instruction(task)
+    _lang_prefix = (lang_inst + "\n\n") if lang_inst else ""
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(total_workers, 2)) as pool:
         # Core critics (profile-aware roles + score schema)
         futures = {}
         for model_name, role in critic_roles.items():
-            prompt = CONTENT_CRITIC_PROMPT.format(
+            prompt = _lang_prefix + CONTENT_CRITIC_PROMPT.format(
                 task=task, content=content[:15000], role=role,
                 previously_fixed=previously_fixed or "None (first round)",
                 score_schema=score_schema,
@@ -804,7 +819,7 @@ def _run_content_multi_critic(task: str, content: str, previously_fixed: str,
             futures[f] = (model_name, "core")
 
         # Aux critics (profile-aware role)
-        aux_prompt = CONTENT_CRITIC_PROMPT.format(
+        aux_prompt = _lang_prefix + CONTENT_CRITIC_PROMPT.format(
             task=task, content=content[:15000],
             role=aux_role,
             previously_fixed=previously_fixed or "None (first round)",
@@ -918,7 +933,8 @@ def _run_final_polish(task: str, content: str, synth_data: dict,
     if synth_data and isinstance(synth_data, dict):
         key_messages = synth_data.get("key_messages", [])
 
-    prompt = CONTENT_POLISH_PROMPT.format(
+    lang_inst = _detect_language_instruction(task)
+    prompt = (lang_inst + "\n\n" if lang_inst else "") + CONTENT_POLISH_PROMPT.format(
         task=task,
         content=content,
         polish_instruction=polish_instruction,
@@ -1067,7 +1083,8 @@ def run_planning_harness(planning_id: str, task: str, task_type: str = "hybrid",
                     _content_for_rev += f"\n\n[... TRUNCATED {len(content) - 8000} chars. Focus on fixing issues above, do NOT reproduce the full document. Only output changed sections with context.]"
 
                 _ctx_prefix = state.get("_project_context_prefix", "")
-                improve_prompt = _ctx_prefix + CONTENT_IMPROVE_PROMPT.format(
+                _lang_inst = _detect_language_instruction(task)
+                improve_prompt = _ctx_prefix + (_lang_inst + "\n\n" if _lang_inst else "") + CONTENT_IMPROVE_PROMPT.format(
                     task=task, content=_content_for_rev,
                     blocking_issues=_format_issues_compact(rev_focus.get("blocking_issues", [])),
                     regressions="\n".join(str(rr) for rr in rev_focus.get("regressions", [])) or "None",
