@@ -580,8 +580,8 @@ def _win(name: str) -> str:
     return f"{_NPM}\\{name}.cmd"
 
 
-def call_claude(prompt: str, timeout: int = 900, model: str = "") -> str:
-    """Claude CLI - stdin 방식. model 파라미터로 Opus/Sonnet 전환."""
+def call_claude(prompt: str, timeout: int = 900, model: str = "", _retry: int = 0) -> str:
+    """Claude CLI - stdin 방식. model 파라미터로 Opus/Sonnet 전환. overloaded 시 1회 재시도."""
     import tempfile
     prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
@@ -597,11 +597,16 @@ def call_claude(prompt: str, timeout: int = 900, model: str = "") -> str:
             input=prompt,
             capture_output=True, text=True,
             timeout=timeout, encoding="utf-8", errors="replace",
-            cwd=tempfile.gettempdir()  # 빈 temp 폴더에서 실행 → 프로젝트 파일 안 보임
+            cwd=tempfile.gettempdir()
         )
         out = r.stdout.strip()
         if r.returncode != 0 and not out:
             return f"[ERROR] Claude (rc={r.returncode}): {r.stderr[:500]}"
+        # overloaded_error 감지 → 30초 대기 후 1회 재시도
+        if out and "overloaded" in out.lower() and _retry < 1:
+            print(f"  [CLAUDE] Overloaded — retrying in 30s...")
+            time.sleep(30)
+            return call_claude(prompt, timeout, model, _retry=_retry + 1)
         return out if out else f"[ERROR] Claude empty: {r.stderr[:300]}"
     except subprocess.TimeoutExpired: return "[ERROR] Claude timeout"
     except FileNotFoundError: return "[ERROR] Claude CLI not found"
