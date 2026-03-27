@@ -1,22 +1,91 @@
 {
-  "threshold": 8.0,
-  "max_rounds": 10,
-  "models": {
-    "generator": "claude-code-cli",
-    "critic": "codex-cli",
-    "verifier": "gemini-api",
-    "synthesizer": "claude-code-cli"
+  "version": "5.3",
+  "description": "2-Pair Core (Claude Opus 4.6 + Codex 5.4) + Open Source Auxiliary + Adaptive Horcrux",
+
+  "core_pair": {
+    "a": {
+      "provider": "claude-cli",
+      "model": "opus-4.6",
+      "roles": ["generator", "judge", "synthesizer"]
+    },
+    "b": {
+      "provider": "codex-cli",
+      "model": "codex-5.4",
+      "roles": ["counter-generator", "critic"]
+    }
   },
+
+  "auxiliary": {
+    "groq": {
+      "model": "llama-3.1-70b-versatile",
+      "roles": ["aux-critic", "verifier", "router"]
+    },
+    "together": {
+      "model": "deepseek-ai/DeepSeek-V3",
+      "roles": ["aux-critic", "verifier"]
+    },
+    "openrouter": {
+      "model": "meta-llama/llama-3.1-70b-instruct:free",
+      "roles": ["aux-critic"]
+    }
+  },
+
+  "debate": {
+    "threshold": 8.0,
+    "max_rounds": 10,
+    "mode": "2pair",
+    "parallel_critics": true,
+    "aux_as_tiebreaker": true
+  },
+
   "scoring": {
     "categories": ["accuracy", "completeness", "edge_cases", "practicality"],
-    "weights": [0.3, 0.25, 0.2, 0.25]
+    "weights": [0.3, 0.25, 0.2, 0.25],
+    "core_weight": 0.8,
+    "aux_weight": 0.2
   },
-  "cli": {
-    "claude_code": "claude",
-    "codex": "codex"
+
+  "adaptive": {
+    "enabled": true,
+    "default_mode": "standard",
+    "llm_fallback_enabled": false,
+    "confidence_threshold": 0.6,
+    "revision_hard_cap": 2
   },
-  "gemini": {
-    "model": "gemini-2.0-flash",
-    "api_key_env": "GEMINI_API_KEY"
+
+  "adaptive_horcrux": {
+    "timeouts": {
+      "generator_ms": 30000,
+      "synth_ms": 25000,
+      "core_critic_ms": 25000,
+      "aux_critic_ms": 15000,
+      "revision_ms": 25000,
+      "light_critic_ms": 12000
+    },
+    "routing": {
+      "llm_fallback_threshold": 0.6,
+      "safe_default_mode": "standard",
+      "enable_heuristic_routing": true,
+      "enable_llm_fallback": false,
+      "enable_mode_override": true
+    },
+    "revision": {
+      "hard_cap": 2,
+      "min_progress_delta": 0.05
+    }
+  },
+
+  "timeouts": {
+    "round_1": 180,
+    "round_2": 300,
+    "round_3": 420,
+    "default": 300,
+    "aux_api": 60
+  },
+
+  "context": {
+    "max_prompt_chars": 16000,
+    "truncate_strategy": "head_tail",
+    "keep_last_rounds": 2
   }
 }

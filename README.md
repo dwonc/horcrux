@@ -1,52 +1,62 @@
-# Debate Chain 🔗
+# Horcrux
 
-**3-AI 멀티모델 오케스트레이션 시스템**
+**Adaptive Multi-AI Orchestration Engine**
 
-Claude Opus 4.6 + GPT-5.4 (Codex) + Gemini를 조합하여 코드 리뷰, 코드 생성, 기획 검증을 자동화합니다. 모든 AI는 **CLI 구독 기반**으로 호출되어 API 과금이 없습니다.
+One prompt, best pipeline. Task를 자동 분류하고 최적 AI 파이프라인으로 라우팅합니다 — 간단한 1-pass 수정부터 멀티 라운드 debate loop, 병렬 코드 생성, PPT/PDF 아티팩트 생성까지.
+
+## v8 — Single Entry Point
+
+```
+사용자: "이 코드 typo 수정해줘"     → auto → fast → 즉시 결과
+사용자: "브레인스토밍해줘"           → auto → planning_pipeline → 4-phase
+사용자: "아키텍처 리팩토링해줘"      → auto → adaptive_full → 2-round debate
+사용자: "3개 AI로 동시에 만들어줘"   → auto → pair_generation → 병렬
+사용자: "이 솔루션 3번 개선해줘"     → auto → self_improve → 반복 개선
+```
+
+**외부 모드 5개** (사용자가 볼 것): `Auto` / `Fast` / `Standard` / `Full` / `Parallel`
+**내부 엔진 7개** (자동 선택): `adaptive_fast` / `adaptive_standard` / `adaptive_full` / `debate_loop` / `planning_pipeline` / `pair_generation` / `self_improve`
 
 ## 모드
 
-### 🔍 Debate (3-AI 코드 리뷰)
+### Auto (기본)
 ```
-Claude(생성) → Codex(Critic) + Gemini(Verifier) 병렬 → 수렴까지 반복
+Task → Classifier(heuristic) → intent 감지 + 난이도 분류 → 최적 엔진 자동 선택
 ```
-- 코드 품질 검증, 보안 리뷰, 아키텍처 평가
-- 점수 8.0/10 이상이면 수렴 (converged)
-- 최대 5라운드
+사용자는 모드를 몰라도 됨. 자연어로 말하면 Horcrux가 알아서 라우팅.
 
-### ⚡ Pair2 (2-AI 병렬 생성)
+### Fast
 ```
-Claude(Architect) → Claude(Part1) + Codex(Part2) 병렬 생성
+Claude(1-pass) → Light Critic → Optional Revision → 결과
 ```
-- Architect가 태스크를 자동으로 2파트로 분할
-- 단일 모델 대비 **속도 ~50% 향상**
+간단한 수정, 저위험. 20~60초.
 
-### 🚀 Pair3 (3-AI 병렬 생성)
+### Standard
 ```
-Claude(Architect) → Claude(Part1) + Codex(Part2) + Gemini(Part3) 병렬 생성
+Pair Generation(Claude+Codex) → Synthesizer → Core Critic → Revision(max 2) → 결과
 ```
-- 3파트 분할, 풀스택+ML 프로젝트에 적합
+중간 복잡도. 60~180초.
 
-## 사전 준비
+### Full
+```
+Pair Generation → Synthesizer → Core Critic(2) → Aux Critic(3, 조건부) → Convergence → Revision Loop → 결과
+```
+고난도 아키텍처, 보안 감사, PPT/PDF 생성. 3~10분.
 
-| 도구 | 설치 | 구독 |
-|------|------|------|
-| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` | Claude Max ($100/월) |
-| Codex CLI | `npm install -g @openai/codex` | ChatGPT Plus ($20/월) |
-| Gemini CLI | `npm install -g @anthropic-ai/gemini` 또는 별도 설치 | 무료 (할당량 제한) |
-| Python 3.11+ | [python.org](https://python.org) | - |
-| Node.js 18+ | [nodejs.org](https://nodejs.org) | - |
-
-> 상세 설치 가이드는 [GUIDE.md](GUIDE.md) 참조
+### Parallel
+```
+Architect(Claude) → 2~3 AI 병렬 생성 (비판 없음, 순수 속도)
+```
+파트별 분할 작업. Pair2(Claude+Codex) / Pair3(Claude+Codex+Gemini).
 
 ## 빠른 시작
 
 ```bash
 # 1. 클론
-git clone https://github.com/dwonc/debate-chain.git
-cd debate-chain
+git clone https://github.com/dwonc/horcrux.git
+cd horcrux
 
-# 2. 의존성 설치
+# 2. 의존성
 pip install -r requirements.txt
 npm install
 
@@ -54,89 +64,142 @@ npm install
 cp .env.example .env
 # .env 파일 편집하여 API 키 입력
 
-# 4. 웹 서버 실행
-python server.py
-# → http://localhost:5000
-
-# 5. (선택) MCP 서버 — Claude Desktop 연동
-# claude_desktop_config.json에 debate-chain 추가 (GUIDE.md 참조)
+# 4. 실행
+start.bat                    # Windows 원클릭
+# 또는
+python server.py             # Web UI → http://localhost:5000
 ```
+
+## 사전 준비
+
+| 도구 | 설치 | 구독 |
+|------|------|------|
+| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` | Claude Max ($100/월) |
+| Codex CLI | `npm install -g @openai/codex` | ChatGPT Plus ($20/월) |
+| Gemini CLI | 별도 설치 | 무료 (할당량 제한) |
+| Python 3.11+ | [python.org](https://python.org) | - |
+| Node.js 18+ | [nodejs.org](https://nodejs.org) | - |
+
+> 상세 설치 가이드는 [GUIDE.md](GUIDE.md) 참조
 
 ## 사용법
 
-### 웹 UI (http://localhost:5000)
-- 브라우저에서 태스크 입력 → 실시간 라운드 진행 표시
-- 스레드 히스토리, 점수 추이, 결과 복사
+### Web UI (http://localhost:5000)
+모드 버튼 5개로 전환: **Auto** / **Fast** / **Standard** / **Full** / **Parallel**
 
 ### MCP (Claude Desktop 연동)
-Claude Desktop에서 자연어로 호출:
+```json
+{
+  "mcpServers": {
+    "horcrux": {
+      "command": "node",
+      "args": ["D:\\Custom_AI-Agent_Project\\horcrux\\mcp_server.js"],
+      "env": {
+        "GROQ_API_KEY": "gsk_xxxx",
+        "DEEPSEEK_API_KEY": "sk-xxxx",
+        "OPENROUTER_API_KEY": "sk-or-v1-xxxx"
+      }
+    }
+  }
+}
 ```
-"이 코드 리뷰해줘"        → debate_start
-"JWT 인증 만들어줘"       → pair2_start
-"추천 시스템 3파트로"      → pair3_start
-"연결 테스트"             → debate_test
-```
+MCP 도구 5개: `run` / `check` / `classify` / `analytics` / `horcrux_test`
 
 ### CLI
 ```bash
-python orchestrator.py "Python으로 JWT 인증 구현해줘"
+python adaptive_orchestrator.py "fix typo in README"
+python adaptive_orchestrator.py --mode fast "간단한 버그 수정"
+python adaptive_orchestrator.py --mode full_horcrux --risk high -f task.txt
+```
+
+## 아키텍처
+
+### Unified Entry Point (v8)
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Horcrux v8                            │
+│  ┌──────┬──────┬──────────┬──────┬──────────┐          │
+│  │ Auto │ Fast │ Standard │ Full │ Parallel │          │
+│  └──┬───┴──┬───┴────┬─────┴──┬───┴────┬─────┘          │
+│     │      │        │        │        │                 │
+│     ▼      ▼        ▼        ▼        ▼                 │
+│  Classifier → Internal Engine 자동 선택                  │
+│  ┌─────────┬───────────┬──────────┬───────────┬───────┐│
+│  │adaptive │adaptive   │adaptive  │planning   │pair   ││
+│  │_fast    │_standard  │_full     │_pipeline  │_gen   ││
+│  │         │           │debate    │self       │       ││
+│  │         │           │_loop     │_improve   │       ││
+│  └─────────┴───────────┴──────────┴───────────┴───────┘│
+└─────────────────────────────────────────────────────────┘
+```
+
+### Debate Loop (Full mode)
+```
+┌──────────┐    ┌──────────────────────────┐    ┌────────────┐
+│ Claude   │───→│ Codex+Gemini+Aux         │───→│ Codex      │
+│ Generator│    │ 5 Critics (병렬)          │    │ Synthesizer│
+└────┬─────┘    └──────────────────────────┘    └────────────┘
+     │              ↑ score < 8.0                     │
+     └────────────────────────────────────────────────┘
+```
+
+### Pair (Parallel mode)
+```
+┌──────────┐
+│ Architect │── 태스크 분할
+└─────┬────┘
+  ┌───┴───┐───────┐
+  ↓       ↓       ↓
+Claude  Codex   Gemini   ← 병렬 생성
+Part1   Part2   Part3
 ```
 
 ## 프로젝트 구조
 
 ```
-debate-chain/
-├── server.py          # Flask 웹 서버 (debate + pair 엔진)
-├── mcp_server.js      # MCP 서버 (Claude Desktop 연동, Node.js)
-├── orchestrator.py    # CLI 버전
-├── config.json        # threshold, max_rounds 설정
-├── start.bat          # 더블클릭 실행 (Windows)
-├── package.json       # Node.js 의존성 (@modelcontextprotocol/sdk)
-├── requirements.txt   # Python 의존성 (flask)
-├── .env.example       # 환경변수 템플릿
-├── docs/              # 디베이트 결과 문서
-└── logs/              # 세션별 JSON 로그
+horcrux/
+├── server.py                  # Flask 웹 서버 (v8 통합 UI + API)
+├── adaptive_orchestrator.py   # Adaptive 진입점 (CLI + 라이브러리)
+├── mcp_server.js              # MCP 서버 v8.0 (Node.js, Claude Desktop)
+├── mcp_server.py              # MCP 서버 (legacy Python)
+├── orchestrator.py            # Legacy debate CLI
+├── planning_v2.py             # Layer 3 Planning 파이프라인
+├── config.json                # threshold, max_rounds, adaptive 설정
+├── start.bat                  # Windows 원클릭 실행
+├── core/
+│   ├── adaptive/
+│   │   ├── classifier.py      # v8 intent detection + engine routing
+│   │   ├── config.py          # Timeout, routing, revision 설정
+│   │   ├── stage_plan.py      # Mode별 stage 구성
+│   │   ├── revision_gate.py   # Revision hard cap + 중단 판정
+│   │   ├── timeout_budget.py  # Stage별 timeout + latency logging
+│   │   ├── compact_memory.py  # 3-layer memory + checkpoint + delta
+│   │   ├── writer_lock.py     # Single writer rule
+│   │   ├── patch_format.py    # JSON patch 표준화
+│   │   ├── conditional_aux.py # 조건부 aux 활성화
+│   │   ├── artifact_spec.py   # Artifact spec 렌더링
+│   │   ├── fallback_chain.py  # 고급 stage별 fallback
+│   │   └── analytics.py       # Timeout tuning + critic reliability + dashboard
+│   ├── provider.py            # CLI/API provider 추상화
+│   ├── job_store.py           # SQLite job 저장
+│   ├── security.py            # 보안
+│   └── tools.py               # 도구
+├── docs/                      # 기획 문서, 디베이트 결과
+├── logs/                      # 세션별 JSON 로그 + latency jsonl
+└── tests/                     # 테스트
 ```
 
-## 아키텍처
+## Analytics API
 
-### Debate 모드
-```
-┌─────────┐    ┌─────────┐    ┌──────────┐
-│ Claude   │───→│ Codex   │───→│ Gemini   │
-│Generator │    │ Critic  │    │ Verifier │
-└────┬─────┘    └─────────┘    └──────────┘
-     │              ↑ 병렬 실행 ↑
-     │         avg(score) < 8.0
-     └──────── Synthesizer ────────────────┘
-```
+운영 데이터 기반 자동 최적화 대시보드:
 
-### Pair 모드
-```
-┌──────────────┐
-│ Claude       │ ── API Spec / 태스크 분할
-│ Architect    │
-└──────┬───────┘
-       │
-  ┌────┴────┐────────┐
-  ↓         ↓        ↓
-Claude   Codex    Gemini    ← 병렬 실행
-Part 1   Part 2   Part 3
-```
-
-## 설정 (config.json)
-
-```json
-{
-  "threshold": 8.0,      // 수렴 기준 점수
-  "max_rounds": 5,       // 최대 라운드
-  "models": {
-    "generator": "claude-code-cli",
-    "critic": "codex-cli",
-    "verifier": "gemini-cli"
-  }
-}
-```
+| 엔드포인트 | 설명 |
+|-----------|------|
+| `GET /api/analytics` | 전체 대시보드 (모든 메트릭 통합) |
+| `GET /api/analytics/timeouts` | Stage별 P50/P90/P99 + timeout 추천 |
+| `GET /api/analytics/critics` | Critic별 신뢰도 + 가중치 |
+| `GET /api/analytics/modes` | 모드별 usage/score/latency |
+| `GET /api/analytics/heuristic` | Heuristic 미세 조정 추천 |
 
 ## Gemini 모델 자동 폴백
 

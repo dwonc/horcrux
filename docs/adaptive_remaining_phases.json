@@ -1,0 +1,312 @@
+{
+  "document_type": "implementation_spec_for_claude_code",
+  "title": "adaptive_horcrux_remaining_work",
+  "language": "ko",
+  "date": "2026-03-27",
+  "project_root": "D:\\Custom_AI-Agent_Project\\horcrux",
+
+  "urgent_fix": {
+    "issue": "adaptive를 /adaptive 별도 페이지로 뺐는데, 메인 UI(/)에 통합해야 함",
+    "what_to_do": [
+      "adaptive_routes.py 삭제 — 더 이상 필요 없음",
+      "run_server.py 삭제 — server.py 직접 사용으로 복귀",
+      "start.bat에서 run_server.py → server.py로 복귀",
+      "server.py의 메인 HTML_TEMPLATE 안 mode switcher에 Adaptive 모드 버튼 추가",
+      "server.py에 /api/adaptive/classify, /api/adaptive/run, /api/adaptive/config 라우트 직접 추가",
+      "메인 UI JS에서 curMode === 'adaptive' 분기 + adaptive 전용 옵션(scope, risk, files, artifact_type) UI 토글",
+      "adaptive 실행 시 /api/adaptive/run 호출, 결과는 기존 messages/resultArea에 렌더링"
+    ],
+    "main_ui_mode_switcher_changes": {
+      "current_modes": ["debate", "planning", "pair2", "pair3"],
+      "new_modes": ["debate", "planning", "adaptive", "pair2", "pair3"],
+      "adaptive_button": {
+        "id": "modeAdaptive",
+        "label": "Adaptive",
+        "gradient": "linear-gradient(135deg, #58a6ff, #bc8cff)",
+        "description": "Fast / Standard / Full Horcrux — heuristic 자동 분류 or 수동 모드 지정"
+      }
+    },
+    "adaptive_options_ui": {
+      "show_when": "curMode === 'adaptive'",
+      "elements": [
+        {"id": "adaptiveMode", "type": "select", "options": ["auto", "fast", "standard", "full_horcrux"], "default": "auto"},
+        {"id": "adaptiveScope", "type": "select", "options": ["small", "medium", "large"], "default": "medium"},
+        {"id": "adaptiveRisk", "type": "select", "options": ["low", "medium", "high"], "default": "medium"},
+        {"id": "adaptiveFiles", "type": "number", "default": 1, "min": 1},
+        {"id": "adaptiveTaskType", "type": "select", "options": ["code", "document", "artifact", "analysis"], "default": "code"},
+        {"id": "adaptiveArtifact", "type": "select", "options": ["none", "ppt", "pdf", "doc"], "default": "none"}
+      ]
+    },
+    "api_routes_to_add_in_server_py": [
+      {
+        "path": "/api/adaptive/classify",
+        "method": "POST",
+        "handler": "from core.adaptive import classify_task_complexity; result = classify_task_complexity(...); return jsonify(result.to_dict())"
+      },
+      {
+        "path": "/api/adaptive/run",
+        "method": "POST",
+        "handler": "from adaptive_orchestrator import run_adaptive; result = run_adaptive(...); return jsonify(result)"
+      },
+      {
+        "path": "/api/adaptive/config",
+        "method": "GET",
+        "handler": "from core.adaptive import get_config; return jsonify(get_config().to_dict())"
+      }
+    ],
+    "files_to_delete": [
+      "adaptive_routes.py",
+      "run_server.py"
+    ],
+    "files_to_modify": [
+      {
+        "file": "server.py",
+        "changes": [
+          "HTML_TEMPLATE 안 mode switcher에 Adaptive 버튼 추가",
+          "HTML_TEMPLATE 안 input-area에 adaptive 옵션 div 추가 (adaptiveOpts)",
+          "JS setMode()에 adaptive 분기 추가",
+          "JS startDebate()에 curMode === 'adaptive' 분기 추가 → /api/adaptive/run 호출",
+          "Flask route 3개 추가 (/api/adaptive/classify, /api/adaptive/run, /api/adaptive/config)",
+          "import 추가: from core.adaptive import classify_task_complexity, get_config",
+          "서버 시작 시 print에 Adaptive 안내 추가"
+        ]
+      },
+      {
+        "file": "start.bat",
+        "changes": ["py run_server.py → py server.py 복귀"]
+      }
+    ]
+  },
+
+  "phase_1_5": {
+    "purpose": "Phase 1 안정화 후 context/tokens 문제를 점진적으로 해결",
+    "prerequisite": "Phase 1 (routing + timeout + revision cap)이 안정적으로 운영 중일 것",
+    "items": [
+      {
+        "name": "compact_state_memory",
+        "description": "전체 대화/출력을 매번 다시 넣지 않고 작업 상태를 압축해서 유지",
+        "mode_specific_policy": {
+          "fast": "working_memory only or skip entirely",
+          "standard": "working_memory + result_summary_memory",
+          "full_horcrux": "working_memory + decision_memory + result_summary_memory (3-layer 전부)"
+        },
+        "memory_layers": {
+          "working_memory": {
+            "schema": {"task": "string", "current_goal": "string", "blocking_issues": ["string"], "preserve": ["string"], "must_not_change": ["string"]}
+          },
+          "decision_memory": {
+            "schema": {"accepted_decisions": [{"topic": "string", "choice": "string", "reason": "string"}], "rejected_alternatives": [{"topic": "string", "alternative": "string", "reason_not_selected": "string"}], "open_questions": ["string"]}
+          },
+          "result_summary_memory": {
+            "schema": {"content_summary": "string", "structure_summary": "string", "key_messages": ["string"], "resolved_items": ["string"], "remaining_blockers": ["string"]}
+          }
+        },
+        "required_functions": [
+          "update_working_memory()",
+          "update_decision_memory()",
+          "update_result_summary_memory()"
+        ],
+        "hard_rule": "다음 단계 prompt에는 full previous output 대신 compact memory만 기본 입력으로 사용"
+      },
+      {
+        "name": "create_round_checkpoint",
+        "description": "매 라운드 후 요약 체크포인트를 생성하여 컨텍스트 잘림 방지",
+        "output_schema": {
+          "round": 1,
+          "current_conclusion": "string",
+          "what_changed": ["string"],
+          "remaining_blockers": ["string"],
+          "preserve": ["string"],
+          "must_not_change": ["string"]
+        },
+        "usage_rule": "이전 라운드 전체 출력 대신 checkpoint summary를 다음 라운드의 기본 입력으로 사용"
+      },
+      {
+        "name": "delta_based_prompting",
+        "description": "매 단계마다 전체 이슈를 반복하지 않고 새로 바뀐 것과 핵심 blocker만 전달",
+        "schema": {
+          "current_state_summary": "string",
+          "new_blockers": ["string"],
+          "resolved_items": ["string"],
+          "preserve": ["string"],
+          "next_action": "string"
+        },
+        "hard_rules": [
+          "previous full output 재삽입 금지",
+          "critic 전체 목록 재삽입 금지",
+          "이미 accepted된 내용은 짧은 preserve 항목으로만 전달",
+          "blocking issue와 delta만 중심으로 전달"
+        ]
+      }
+    ]
+  },
+
+  "phase_2": {
+    "purpose": "writer/patch/artifact 안정화 + aux 고도화",
+    "prerequisite": "Phase 1.5 (compact memory + checkpoint + delta prompting)이 안정적일 것",
+    "items": [
+      {
+        "name": "single_writer_rule_enforcement",
+        "description": "여러 CLI 에이전트가 동시에 파일을 write하지 못하게 하여 충돌 방지",
+        "roles": {
+          "generators": ["read", "propose_patch"],
+          "critics": ["read", "comment"],
+          "director": ["read", "select", "merge"],
+          "writer": ["read", "write", "run_tests"]
+        }
+      },
+      {
+        "name": "patch_format_standardization",
+        "description": "propose_patch 포맷을 JSON patch로 통일하여 director merge 가능하게 함",
+        "preferred_format": "json_patch_with_reason",
+        "schema": {
+          "file": "path/to/file",
+          "hunks": [
+            {
+              "start_line": 10,
+              "end_line": 15,
+              "original": "old code",
+              "proposed": "new code",
+              "reason": "why this change"
+            }
+          ]
+        }
+      },
+      {
+        "name": "conditional_aux_usage_refinement",
+        "description": "Aux critic을 항상 돌리지 않고 불확실하거나 중요할 때만 활성화",
+        "activation_conditions": [
+          "core critic disagreement 발생",
+          "overall score가 threshold 근처에서 애매함",
+          "critical issue unresolved",
+          "task mode == full_horcrux",
+          "high-risk task"
+        ],
+        "skip_conditions": [
+          "fast mode",
+          "low-risk change",
+          "clear convergence from core critics only"
+        ],
+        "required_function": {
+          "name": "should_run_aux_critics",
+          "input": {
+            "mode": "fast|standard|full_horcrux",
+            "core_scores": {"model_a": 0.0, "model_b": 0.0},
+            "critical_issue_count": 0,
+            "risk_level": "low|medium|high"
+          },
+          "output": {"run_aux": false, "reason": "string"}
+        }
+      },
+      {
+        "name": "artifact_spec_optimization",
+        "description": "PPT/PDF 같은 artifact는 멀티모델이 파일 자체를 직접 수정하지 않고 spec 기반 렌더링으로 간소화",
+        "rules": [
+          "artifact 단계는 final content package를 입력으로 받음",
+          "artifact_profile은 내용 재해석 금지",
+          "PPT/PDF는 artifact-ready spec을 만든 후 최종 renderer가 생성",
+          "artifact critic은 정보량/흐름/누락만 점검"
+        ]
+      },
+      {
+        "name": "advanced_fallback_chain",
+        "description": "Phase 1의 minimum default fallback action 위에 더 정교한 chain을 구축",
+        "fallback_chain_per_stage": {
+          "generator": ["retry_once", "use_partial_results", "fallback_model"],
+          "synth": ["use_best_candidate", "retry_with_shorter_prompt"],
+          "core_critic": ["retry_once", "fallback_critic_model", "flag_unresolved"],
+          "aux_critic": ["skip_immediately"],
+          "revision": ["keep_current_version", "flag_blockers"]
+        }
+      }
+    ]
+  },
+
+  "phase_3": {
+    "purpose": "운영 데이터 기반 튜닝 + 자동 최적화",
+    "prerequisite": "Phase 2 완료 + latency jsonl 로그 데이터가 충분히 축적되었을 것",
+    "items": [
+      {
+        "name": "timeout_auto_tuning",
+        "description": "jsonl latency 로그에서 P50/P90/P99를 산출하여 timeout 값을 자동 조정",
+        "approach": "1.5x~2x of P90 → 점진적으로 타이트하게",
+        "data_source": "./logs/horcrux_stage_latency.jsonl"
+      },
+      {
+        "name": "routing_heuristic_refinement",
+        "description": "mode_usage_count, 실제 결과 품질, latency 데이터로 heuristic 키워드와 threshold 미세 조정",
+        "metrics_needed": ["mode_usage_count", "mode_vs_quality_score", "mode_vs_latency"]
+      },
+      {
+        "name": "llm_fallback_for_classification",
+        "description": "Phase 1에서 safe_default=standard로 처리하던 confidence < 0.6 케이스를 lightweight LLM 호출로 대체",
+        "approach": "core pair 중 하나에 10-token 분류 prompt를 보내서 fast/standard/full_horcrux 중 하나 반환",
+        "enable_condition": "config.json의 adaptive_horcrux.routing.enable_llm_fallback = true"
+      },
+      {
+        "name": "critic_reliability_weighting",
+        "description": "critic별 정확도/일관성 이력을 추적하여 점수 가중치를 동적으로 조정",
+        "approach": "critic의 score vs 최종 품질 상관관계를 학습하여 reliable critic에 더 높은 weight 부여"
+      },
+      {
+        "name": "mode_quality_latency_analytics",
+        "description": "모드별 품질/속도 트레이드오프를 대시보드로 시각화",
+        "metrics": [
+          "per_mode_avg_latency",
+          "per_mode_avg_score",
+          "per_mode_convergence_rate",
+          "per_mode_revision_count",
+          "per_mode_timeout_rate"
+        ]
+      }
+    ]
+  },
+
+  "observability_roadmap": {
+    "phase_1_already_done": [
+      "selected_mode (jsonl)",
+      "routing_source (jsonl)",
+      "per_stage_latency_ms (jsonl)",
+      "timeout_count_by_stage (jsonl)",
+      "revision_round_count (jsonl)",
+      "fallback_used (jsonl)"
+    ],
+    "phase_2_add": [
+      "avg_tokens_per_round",
+      "context_truncation_events",
+      "aux_activation_rate",
+      "writer_conflict_prevented_count"
+    ],
+    "phase_3_add": [
+      "mode_vs_quality_correlation",
+      "critic_reliability_score",
+      "heuristic_accuracy_rate",
+      "auto_tuned_timeout_values"
+    ]
+  },
+
+  "current_project_state": {
+    "phase_1_status": "완료 — routing, timeout, revision cap 구현 + 30개 테스트 통과",
+    "files_deployed": {
+      "core/adaptive/": "classifier.py, config.py, stage_plan.py, revision_gate.py, timeout_budget.py, __init__.py",
+      "adaptive_orchestrator.py": "3-tier mode 실행 (fast/standard/full_horcrux)",
+      "mcp_server.py": "v5.3 — adaptive + adaptive_classify 도구 추가",
+      "mcp_adaptive_ext.py": "MCP 도구 정의 + 핸들러",
+      "config.json": "v5.3 — adaptive + adaptive_horcrux + timeout_budget 섹션",
+      "tests/test_phase1.py": "30개 테스트"
+    },
+    "files_to_fix_now": {
+      "adaptive_routes.py": "삭제 (메인 UI 통합으로 불필요)",
+      "run_server.py": "삭제 (server.py 직접 사용)",
+      "server.py": "메인 HTML에 Adaptive 모드 버튼 + 옵션 + JS + API route 추가",
+      "start.bat": "run_server.py → server.py 복귀"
+    }
+  },
+
+  "implementation_order_summary": {
+    "step_0_urgent": "메인 UI에 adaptive 통합 (별도 페이지 제거)",
+    "step_1_phase_1_5": "compact_state_memory → create_round_checkpoint → delta_based_prompting",
+    "step_2_phase_2": "single_writer_rule → patch_format → conditional_aux → artifact_spec → fallback_chain",
+    "step_3_phase_3": "timeout_auto_tuning → routing_refinement → llm_fallback → critic_reliability → analytics"
+  }
+}

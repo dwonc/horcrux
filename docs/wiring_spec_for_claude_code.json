@@ -1,0 +1,224 @@
+{
+  "document_type": "wiring_spec_for_claude_code",
+  "title": "Horcrux v7.2 — server.py 배선 + 메인 UI 통합",
+  "project_root": "D:\\Custom_AI-Agent_Project\\horcrux",
+  "date": "2026-03-27",
+  "context": "모든 Phase(1~3) 모듈은 core/adaptive/ 패키지에 구현 완료. mcp_server.js v7.2도 adaptive/classify/analytics 도구 추가 완료. 하지만 server.py에 Flask API 엔드포인트가 아직 연결 안 됐고, 메인 UI에 Adaptive 모드 버튼이 없음. 이 spec은 배선(wiring) 작업만 정의함.",
+
+  "task_1_server_py_api_routes": {
+    "purpose": "mcp_server.js가 호출하는 Flask API 엔드포인트를 server.py에 추가",
+    "prerequisite": "server.py 상단에 import 추가 필요",
+    "imports_to_add": [
+      "from core.adaptive import classify_task_complexity, build_stage_plan, get_config, HorcruxMode",
+      "from core.adaptive.analytics import build_analytics_dashboard, compute_latency_percentiles, auto_tune_timeouts, compute_critic_reliability, compute_mode_usage_stats, suggest_heuristic_refinements"
+    ],
+    "routes": [
+      {
+        "path": "/api/adaptive/classify",
+        "method": "POST",
+        "description": "task 난이도 분류만 실행 (미리보기용)",
+        "request_body": {
+          "task": "string (required)",
+          "task_type": "code|document|artifact|analysis (default: code)",
+          "num_files": "int (default: 1)",
+          "scope": "small|medium|large (default: medium)",
+          "risk": "low|medium|high (default: medium)",
+          "artifact_type": "none|ppt|pdf|doc (default: none)"
+        },
+        "handler_logic": "result = classify_task_complexity(task_description=data['task'], task_type=data.get('task_type','code'), num_files_touched=data.get('num_files',1), estimated_scope=data.get('scope','medium'), risk_level=data.get('risk','medium'), artifact_type=data.get('artifact_type','none')); return jsonify(result.to_dict())"
+      },
+      {
+        "path": "/api/adaptive/run",
+        "method": "POST",
+        "description": "Adaptive Horcrux 전체 실행",
+        "request_body": {
+          "task": "string (required)",
+          "task_type": "string (default: code)",
+          "num_files": "int (default: 1)",
+          "scope": "string (default: small)",
+          "risk": "string (default: low)",
+          "artifact_type": "string (default: none)",
+          "mode_override": "string|null (fast/standard/full_horcrux)"
+        },
+        "handler_logic": "from adaptive_orchestrator import run_adaptive, load_config; config = load_config(); result = run_adaptive(task=data['task'], config=config, mode_override=data.get('mode_override'), task_type=data.get('task_type','code'), num_files=data.get('num_files',1), scope=data.get('scope','small'), risk=data.get('risk','low'), artifact_type=data.get('artifact_type','none')); return jsonify({...result, final_solution truncated to 10KB})",
+        "note": "이 route는 동기 실행이라 Flask worker를 블로킹함. 큰 문제는 아니지만 인지할 것."
+      },
+      {
+        "path": "/api/adaptive/config",
+        "method": "GET",
+        "description": "현재 adaptive config 조회",
+        "handler_logic": "cfg = get_config(); return jsonify(cfg.to_dict())"
+      },
+      {
+        "path": "/api/analytics",
+        "method": "GET",
+        "description": "전체 analytics 대시보드",
+        "handler_logic": "dashboard = build_analytics_dashboard(); return jsonify(dashboard.to_dict())"
+      },
+      {
+        "path": "/api/analytics/timeouts",
+        "method": "GET",
+        "description": "stage별 P50/P90/P99 + timeout 추천",
+        "handler_logic": "stats = compute_latency_percentiles(); return jsonify({k: v.to_dict() for k, v in stats.items()})"
+      },
+      {
+        "path": "/api/analytics/timeouts/apply",
+        "method": "POST",
+        "description": "추천 timeout을 config에 실제 반영",
+        "handler_logic": "recs = auto_tune_timeouts(dry_run=False); return jsonify({'applied': recs})"
+      },
+      {
+        "path": "/api/analytics/critics",
+        "method": "GET",
+        "description": "critic별 reliability/weight",
+        "handler_logic": "stats = compute_critic_reliability(); return jsonify({k: v.to_dict() for k, v in stats.items()})"
+      },
+      {
+        "path": "/api/analytics/modes",
+        "method": "GET",
+        "description": "모드별 usage/score/latency",
+        "handler_logic": "stats = compute_mode_usage_stats(); return jsonify({k: v.to_dict() for k, v in stats.items()})"
+      },
+      {
+        "path": "/api/analytics/heuristic",
+        "method": "GET",
+        "description": "heuristic 미세 조정 추천",
+        "handler_logic": "ref = suggest_heuristic_refinements(); return jsonify(ref.to_dict())"
+      }
+    ]
+  },
+
+  "task_2_main_ui_adaptive_integration": {
+    "purpose": "별도 /adaptive 페이지가 아니라 메인 UI(/)의 mode switcher에 Adaptive 버튼을 추가",
+    "file": "server.py 내 HTML_TEMPLATE",
+    "changes": [
+      {
+        "location": "mode switcher 버튼 영역 (modeDebate, modePlan, modePair2, modePair3 옆)",
+        "add": "Adaptive 버튼",
+        "html": "<button id=\"modeAdaptive\" class=\"btn\" onclick=\"setMode('adaptive')\" style=\"padding:4px 12px;font-size:11px;background:#2a2a4a;color:#888;border:1px solid #3a3a5a\">Adaptive</button>",
+        "position": "modePlan 뒤, modePair2 앞"
+      },
+      {
+        "location": "input-area 안에 planOpts div 옆",
+        "add": "adaptiveOpts div — curMode === 'adaptive'일 때만 표시",
+        "html_id": "adaptiveOpts",
+        "elements": [
+          {"id": "adaptiveMode", "tag": "select", "options": ["auto", "fast", "standard", "full_horcrux"], "default": "auto", "label": "Mode"},
+          {"id": "adaptiveScope", "tag": "select", "options": ["small", "medium", "large"], "default": "medium", "label": "Scope"},
+          {"id": "adaptiveRisk", "tag": "select", "options": ["low", "medium", "high"], "default": "medium", "label": "Risk"},
+          {"id": "adaptiveFiles", "tag": "input[type=number]", "default": 1, "min": 1, "label": "Files"},
+          {"id": "adaptiveTaskType", "tag": "select", "options": ["code", "document", "artifact", "analysis"], "default": "code", "label": "Type"},
+          {"id": "adaptiveArtifact", "tag": "select", "options": ["none", "ppt", "pdf", "doc"], "default": "none", "label": "Artifact"}
+        ],
+        "style": "display:flex;gap:8px;align-items:center;margin-left:4px",
+        "visibility": "display: curMode === 'adaptive' ? 'flex' : 'none'"
+      }
+    ],
+    "js_changes": [
+      {
+        "function": "setMode()",
+        "add_mode": "adaptive",
+        "gradient": "linear-gradient(135deg, #58a6ff, #bc8cff)",
+        "description": "Fast / Standard / Full Horcrux — heuristic 자동 분류",
+        "roles_html": "<span style=\"color:#58a6ff\">Adaptive</span><span style=\"color:#3fb950\">Fast</span><span style=\"color:#d29922\">Standard</span><span style=\"color:#f85149\">Full Horcrux</span>",
+        "btn_text": "Run Adaptive",
+        "show_adaptiveOpts": true,
+        "hide_planOpts": true
+      },
+      {
+        "function": "startDebate()",
+        "add_branch": "if (curMode === 'adaptive')",
+        "api_call": {
+          "url": "/api/adaptive/run",
+          "method": "POST",
+          "body": {
+            "task": "$('taskInput').value",
+            "task_type": "$('adaptiveTaskType').value",
+            "num_files": "parseInt($('adaptiveFiles').value)",
+            "scope": "$('adaptiveScope').value",
+            "risk": "$('adaptiveRisk').value",
+            "artifact_type": "$('adaptiveArtifact').value",
+            "mode_override": "$('adaptiveMode').value === 'auto' ? null : $('adaptiveMode').value"
+          }
+        },
+        "on_response": "결과를 messages/resultArea에 렌더링. adaptive는 동기 실행이라 polling 불필요 — 바로 결과 표시. converged/mode/score/rounds/stages/final_solution 표시."
+      }
+    ]
+  },
+
+  "task_3_adaptive_orchestrator_wiring": {
+    "purpose": "adaptive_orchestrator.py의 _run_standard()와 _run_full_horcrux()에서 Phase 1.5~2 모듈을 연결",
+    "file": "adaptive_orchestrator.py",
+    "wiring_points": [
+      {
+        "function": "_run_standard()",
+        "integrate": [
+          "CompactMemory(mode='standard', task=task) — 라운드 시작 시 생성",
+          "memory.update_from_critic(critic_text, critic_score, round_num, solution[:300]) — critic 후 호출",
+          "memory.build_revision_prompt(task, round_num, current_solution) — revision 프롬프트 생성에 사용 (기존 하드코딩 프롬프트 대체)",
+          "should_run_aux_critics(mode='standard', core_scores, critical_count, risk) — aux 분기 판단",
+          "execute_fallback_chain(FallbackContext(...)) — timeout/failure 시 fallback 처리"
+        ]
+      },
+      {
+        "function": "_run_full_horcrux()",
+        "integrate": [
+          "현재 orchestrator.run_debate()에 위임하고 있으므로, run_debate() 자체를 수정하거나",
+          "또는 _run_full_horcrux()를 _run_standard()처럼 직접 구현하되 aux critic + convergence check 포함",
+          "CompactMemory(mode='full_horcrux', task=task) — 3-layer 전부 활성화",
+          "conditional_aux로 aux 분기",
+          "fallback_chain으로 에러 처리"
+        ],
+        "note": "run_debate() 위임 방식을 유지하려면 run_debate() 안에 CompactMemory를 넣어야 하는데, server.py의 run_debate()가 100KB 파일 안에 있어서 수정이 무거움. _run_full_horcrux()를 독립 구현하는 게 더 깔끔할 수 있음."
+      },
+      {
+        "function": "_run_fast()",
+        "integrate": [
+          "CompactMemory(mode='fast', task=task) — working_memory only",
+          "fast는 1라운드라 memory 업데이트는 생략해도 됨",
+          "fallback_chain은 generator/light_critic timeout 시 사용"
+        ]
+      }
+    ]
+  },
+
+  "task_4_cleanup": {
+    "purpose": "불필요한 파일 정리",
+    "files_to_delete": [
+      "adaptive_routes.py — 메인 UI 통합으로 불필요",
+      "run_server.py — server.py 직접 사용으로 불필요"
+    ],
+    "files_to_check": [
+      "start.bat — py run_server.py → py server.py로 복귀돼있는지 확인",
+      "core/adaptive.py — tombstone 파일, 패키지와 충돌 안 하는지 확인"
+    ]
+  },
+
+  "implementation_order": [
+    "1. server.py에 import + 9개 API route 추가 (task_1)",
+    "2. Flask 서버 시작해서 /api/adaptive/classify, /api/analytics 등 curl로 동작 확인",
+    "3. 메인 HTML_TEMPLATE에 Adaptive 버튼 + 옵션 UI + JS 분기 추가 (task_2)",
+    "4. adaptive_orchestrator.py에 CompactMemory/conditional_aux/fallback_chain 배선 (task_3)",
+    "5. 불필요 파일 정리 (task_4)",
+    "6. start.bat로 전체 시스템 기동 테스트"
+  ],
+
+  "test_checklist": [
+    "curl POST /api/adaptive/classify → mode/confidence/reason 반환되는지",
+    "curl POST /api/adaptive/run → solution/mode/score 반환되는지",
+    "curl GET /api/analytics → 빈 대시보드라도 에러 없이 JSON 반환되는지",
+    "curl GET /api/analytics/timeouts → 빈 결과 or stats 반환되는지",
+    "메인 UI에서 Adaptive 버튼 클릭 → 옵션 패널 표시되는지",
+    "메인 UI에서 Adaptive 모드로 task 실행 → 결과 렌더링되는지",
+    "MCP classify 도구 → /api/adaptive/classify 정상 프록시되는지",
+    "MCP run mode=adaptive → /api/adaptive/run 정상 프록시되는지",
+    "MCP analytics → /api/analytics 정상 프록시되는지"
+  ],
+
+  "critical_notes": [
+    "server.py는 100KB라 전체를 다시 쓰지 말고 필요한 부분만 추가/수정할 것",
+    "HTML_TEMPLATE 안의 JS는 minified 스타일이라 가독성이 낮음 — 주의해서 수정",
+    "adaptive/run은 동기 실행이라 Flask worker를 블로킹함 — production에서는 threading으로 분리 필요하지만 지금은 OK",
+    "/api/adaptive/run에서 final_solution은 10KB로 truncate해서 반환할 것"
+  ]
+}

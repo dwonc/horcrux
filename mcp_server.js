@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
- * Debate Chain MCP Server v7
- * - run: debate / pair2 / pair3 / debate_pair2 / debate_pair3 통합 실행
- * - check: 모든 job 상태 확인 + 완료 시 자동 결과 포함
- * - self_improve: 자기개선 루프
- * - 기존 도구 하위 호환 유지
+ * Horcrux MCP Server v8.0
+ * Adaptive 단일 진입점 — 도구 5개
+ *
+ * - run: 통합 실행 (자연어 task → 자동 분류 → 최적 엔진)
+ * - check: job 상태 확인 + 완료 시 결과 포함
+ * - classify: task 분류 미리보기
+ * - analytics: 운영 데이터 대시보드
+ * - horcrux_test: AI 연결 테스트
  */
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
@@ -33,64 +36,61 @@ function flask(path, method, body) {
   });
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const server = new McpServer({ name: "horcrux", version: "8.0" });
 
-const server = new McpServer({ name: "debate-chain", version: "7.0" });
-
-// ─── 1. run: 통합 실행 도구 ───
+// ─── 1. run: 통합 실행 ───
 server.tool("run",
-  "Run debate, pair, or debate→pair pipeline. Modes: debate, pair2, pair3, debate_pair2, debate_pair3",
+  "Horcrux 메인 실행. task만 넣으면 자동으로 최적 모드/엔진을 선택. 코드 수정, 브레인스토밍, 문서 작성, PPT 생성, 아키텍처 설계 등 모든 작업을 이 도구 하나로 처리. 수동 모드 지정도 가능(fast/standard/full/parallel).",
   {
-    task: z.string().describe("The task to run"),
-    mode: z.enum(["debate", "pair2", "pair3", "debate_pair2", "debate_pair3"]).default("debate"),
-    max_rounds: z.number().optional(),
-    threshold: z.number().optional(),
-    parent_debate_id: z.string().optional().describe("Deep Dive: chain from a previous debate's final_solution"),
-    output_dir: z.string().optional().describe("pair2/pair3 only: 완료 시 생성된 파일을 자동 저장할 프로젝트 경로 (예: D:\\Aegis-Trader)"),
-    project_dir: z.string().optional().describe("debate/debate_pair 모드에서 프로젝트 코드를 자동으로 읽어 분석 context로 활용. (예: D:\\Aegis-Trader)"),
+    task: z.string().describe("자연어 task 설명"),
+    mode: z.enum(["auto", "fast", "standard", "full", "parallel"]).default("auto").describe("auto=자동 분류, fast/standard/full=수동 override, parallel=병렬 생성"),
+    scope: z.enum(["small", "medium", "large"]).optional().describe("작업 규모 (auto-detected if omitted)"),
+    risk: z.enum(["low", "medium", "high"]).optional().describe("위험도 (auto-detected if omitted)"),
+    artifact_type: z.enum(["none", "ppt", "pdf", "doc"]).optional().describe("산출물 형식"),
+    output_dir: z.string().optional().describe("parallel mode only: 파일 자동 저장 경로"),
+    project_dir: z.string().optional().describe("프로젝트 코드를 context로 활용"),
+    audience: z.string().optional().describe("문서/PPT 타겟 독자"),
+    tone: z.string().optional().describe("professional/casual/technical"),
+    iterations: z.number().optional().describe("self_improve 반복 횟수"),
   },
   async (args) => {
     try {
-      const mode = args.mode || "debate";
-      let r, job_id, msg;
+      const body = { task: args.task, mode: args.mode || "auto" };
+      if (args.scope) body.scope = args.scope;
+      if (args.risk) body.risk = args.risk;
+      if (args.artifact_type) body.artifact_type = args.artifact_type;
+      if (args.output_dir) body.output_dir = args.output_dir;
+      if (args.project_dir) body.project_dir = args.project_dir;
+      if (args.audience) body.audience = args.audience;
+      if (args.tone) body.tone = args.tone;
+      if (args.iterations) body.iterations = args.iterations;
 
-      if (mode === "debate") {
-        r = await flask("/api/start", "POST", {
-          task: args.task,
-          max_rounds: args.max_rounds || 5,
-          threshold: args.threshold || 8.0,
-          parent_debate_id: args.parent_debate_id || "",
-          project_dir: args.project_dir || "",
-        });
-        job_id = r.debate_id;
-        msg = `debate_id: ${job_id}\nUse check("${job_id}") to monitor.`;
-        if (r.project_dir) msg += `\nproject_dir: ${r.project_dir} (코드 자동 읽기 활성화)`;
-
-      } else if (mode.startsWith("debate_pair")) {
-        const pairMode = mode.replace("debate_", ""); // pair2 or pair3
-        r = await flask("/api/debate_pair", "POST", {
-          task: args.task,
-          pair_mode: pairMode,
-          threshold: args.threshold || 8.0,
-          max_rounds: args.max_rounds || 3
-        });
-        job_id = r.pipeline_id;
-        msg = `pipeline_id: ${job_id}\ndebate → ${pairMode} pipeline started.\nUse check("${job_id}") to monitor.`;
-
-      } else {
-        // pair2, pair3
-        r = await flask("/api/pair", "POST", {
-          task: args.task,
-          mode: mode,
-          output_dir: args.output_dir || ""
-        });
-        job_id = r.pair_id;
-        msg = `pair_id: ${job_id}\nUse check("${job_id}") to monitor.`;
-        if (r.output_dir) msg += `\noutput_dir: ${r.output_dir} (완료 시 자동 저장)`;
+      // parallel mode: pair_mode 매핑
+      if (args.mode === "parallel") {
+        body.pair_mode = "pair2";  // 기본 2-AI, task에 "3" 포함 시 pair3
+        if (/3|three|세|셋/.test(args.task)) body.pair_mode = "pair3";
       }
 
+      const r = await flask("/api/horcrux/run", "POST", body);
       if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
-      return { content: [{ type: "text", text: msg }] };
+
+      // 동기 응답 (adaptive_* 엔진)
+      if (r.solution) {
+        let t = `## Horcrux: ${r.status === "converged" ? "CONVERGED ✅" : "COMPLETED"}\n\n`;
+        t += `**Mode:** ${r.mode} | **Engine:** ${r.internal_engine} | **Score:** ${r.score || 0}/10 | **Rounds:** ${r.rounds || 0}\n`;
+        t += `**Routing:** ${r.routing?.source} (confidence: ${((r.routing?.confidence || 0) * 100).toFixed(0)}%, intent: ${r.routing?.intent})\n`;
+        t += `\n## Solution\n\`\`\`\n${(r.solution || "").slice(0, 6000)}\n\`\`\``;
+        if ((r.solution || "").length > 6000) t += `\n\n(truncated, full: ${r.solution.length} chars)`;
+        return { content: [{ type: "text", text: t }] };
+      }
+
+      // 비동기 응답 (planning/pair/debate/self_improve)
+      let t = `## Job Started\n\n`;
+      t += `**Engine:** ${r.internal_engine} | **Mode:** ${r.mode}\n`;
+      t += `**Job ID:** ${r.job_id}\n`;
+      t += `**Routing:** ${r.routing?.source} (confidence: ${((r.routing?.confidence || 0) * 100).toFixed(0)}%, intent: ${r.routing?.intent})\n\n`;
+      t += `Use \`check("${r.job_id}")\` to monitor progress.`;
+      return { content: [{ type: "text", text: t }] };
     } catch (e) {
       return { content: [{ type: "text", text: "server.py not running: " + e.message }] };
     }
@@ -99,21 +99,19 @@ server.tool("run",
 
 // ─── 2. check: 통합 상태 확인 + 완료 시 자동 결과 ───
 server.tool("check",
-  "Check status of any job (debate, pair, pipeline). Auto-includes result when done.",
+  "실행 중인 job 상태 확인. 완료 시 자동으로 결과 포함. debate/pair/planning/self_improve 모든 job_id 대응.",
   { job_id: z.string() },
   async (args) => {
     try {
       const id = args.job_id;
-      let status, resultEndpoint;
 
       // pipeline (dp_)
       if (id.startsWith("dp_")) {
-        status = await flask(`/api/pipeline/status/${id}`);
+        const status = await flask(`/api/pipeline/status/${id}`);
         if (status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
         if (status.status === "running") {
           return { content: [{ type: "text", text: `pipeline: ${status.status} | phase: ${status.phase} | debate: ${status.debate_id || "pending"} | pair: ${status.pair_id || "pending"}` }] };
         }
-        // 완료
         const full = await flask(`/api/pipeline/result/${id}`);
         let t = `## Pipeline ${status.status}\n`;
         if (full.debate) {
@@ -133,8 +131,7 @@ server.tool("check",
 
       // pair (pair_)
       if (id.startsWith("pair_")) {
-        status = await flask(`/api/pair/status/${id}`);
-        // "not found" 404 vs job error 구분: id 필드 없으면 진짜 not found
+        const status = await flask(`/api/pair/status/${id}`);
         if (!status.id && status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
         if (status.status === "running") {
           return { content: [{ type: "text", text: `pair: ${status.status} | phase: ${status.phase} | parts_done: ${status.parts_done || 0}` }] };
@@ -153,9 +150,39 @@ server.tool("check",
         return { content: [{ type: "text", text: t }] };
       }
 
+      // planning (plan_)
+      if (id.startsWith("plan_")) {
+        const status = await flask(`/api/planning/status/${id}`);
+        if (status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
+        if (status.status === "running") {
+          return { content: [{ type: "text", text: `planning: ${status.status} | phase: ${status.phase} | ${status.phase_detail || "..."}\nmessages: ${status.message_count || 0} | avg_score: ${(status.avg_score || 0).toFixed(1)}/10` }] };
+        }
+        const full = await flask(`/api/planning/result/${id}`);
+        let t = `## Planning ${full.status} (Avg Critic: ${(full.avg_score || 0).toFixed(1)}/10)\n\n`;
+        const msgs = full.messages || [];
+        const generators = msgs.filter(m => m.role === "generator");
+        const critics = msgs.filter(m => m.role === "critic");
+        if (generators.length) {
+          t += `### Phase 1: ${generators.length} independent plans generated\n`;
+          for (const g of generators) t += `- ${g.label || g.model || "?"}\n`;
+          t += "\n";
+        }
+        const synth = msgs.find(m => m.role === "synthesizer");
+        if (synth) t += `### Phase 2: Opus synthesized unified plan\n${(synth.content || "").slice(0, 2000)}\n\n`;
+        if (critics.length) {
+          t += `### Phase 3: ${critics.length} critics reviewed\n`;
+          for (const c of critics) t += `- ${c.label || c.model}: ${(c.score || "?")}/10\n`;
+          t += "\n";
+        }
+        const final_ = msgs.find(m => m.role === "final");
+        if (final_) t += `### Phase 4: Final Plan (Codex)\n${(final_.content || "").slice(0, 4000)}\n`;
+        if (t.length > 12000) t = t.slice(0, 12000) + "\n\n[...truncated]";
+        return { content: [{ type: "text", text: t }] };
+      }
+
       // self_improve (si_)
       if (id.startsWith("si_")) {
-        status = await flask(`/api/self_improve/status/${id}`);
+        const status = await flask(`/api/self_improve/status/${id}`);
         if (status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
         if (status.status === "running") {
           return { content: [{ type: "text", text: `self_improve: iteration ${status.iteration}/${status.total_iterations}` }] };
@@ -167,16 +194,14 @@ server.tool("check",
       }
 
       // debate (default)
-      status = await flask(`/api/status/${id}`);
+      const status = await flask(`/api/status/${id}`);
       if (status.error) return { content: [{ type: "text", text: "Not found: " + id }] };
       if (status.status === "running") {
         return { content: [{ type: "text", text: `debate: Round ${status.round} | Score: ${(status.avg_score || 0).toFixed(1)}/10 | phase: ${status.phase || "..."}` }] };
       }
-      // 완료 — full result
       const full = await flask(`/api/result/${id}`);
       let t = `## ${full.status === "converged" ? "✅ Converged" : "⚠️ " + full.status}\n`;
       t += `Rounds: ${full.round} | Score: ${(full.avg_score || 0).toFixed(1)}/10\n\n`;
-      // 마지막 라운드 메시지만
       const msgs = full.messages || [];
       const lastGenIdx = msgs.reduce((li, m, i) => m.role === "generator" ? i : li, 0);
       const lastMsgs = msgs.slice(lastGenIdx);
@@ -194,32 +219,119 @@ server.tool("check",
   }
 );
 
-// ─── 3. self_improve ───
-server.tool("self_improve",
-  "Self-improvement loop: iteratively improve a solution (optionally based on a previous debate result)",
+// ─── 3. classify: 분류 미리보기 ───
+server.tool("classify",
+  "task 난이도/의도를 미리보기. 실행하지 않고 어떤 모드/엔진이 선택될지 확인.",
   {
-    task: z.string(),
-    iterations: z.number().optional(),
-    debate_id: z.string().optional().describe("Optional: use final_solution from this debate as starting point"),
+    task: z.string().describe("Task description to classify"),
+    scope: z.enum(["small", "medium", "large"]).optional(),
+    risk: z.enum(["low", "medium", "high"]).optional(),
+    artifact_type: z.enum(["none", "ppt", "pdf", "doc"]).optional(),
   },
   async (args) => {
     try {
-      const r = await flask("/api/self_improve", "POST", {
+      const r = await flask("/api/horcrux/classify", "POST", {
         task: args.task,
-        iterations: args.iterations || 3,
-        debate_id: args.debate_id,
+        scope: args.scope || "medium",
+        risk: args.risk || "medium",
+        artifact_type: args.artifact_type || "none",
       });
-      if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
-      return { content: [{ type: "text", text: `self_improve_id: ${r.self_improve_id}\nUse check("${r.self_improve_id}") to monitor.` }] };
+      let t = `## Task Classification\n\n`;
+      t += `**Mode:** ${r.recommended_mode}\n`;
+      t += `**Engine:** ${r.internal_engine}\n`;
+      t += `**Intent:** ${r.detected_intent}\n`;
+      t += `**Confidence:** ${((r.confidence || 0) * 100).toFixed(0)}%\n`;
+      t += `**Source:** ${r.routing_source}\n`;
+      t += `**Reason:** ${r.reason}\n`;
+      if (r.stages && r.stages.length) t += `**Stages:** ${r.stages.join(" → ")}\n`;
+      return { content: [{ type: "text", text: t }] };
     } catch (e) {
-      return { content: [{ type: "text", text: "server.py not running: " + e.message }] };
+      return { content: [{ type: "text", text: "Error: " + e.message }] };
     }
   }
 );
 
-// ─── 4. test ───
-server.tool("debate_test",
-  "Test AI connections (claude, codex)",
+// ─── 4. analytics: 운영 데이터 대시보드 ───
+server.tool("analytics",
+  "운영 데이터 대시보드. timeout 통계, 모드별 성능, critic 신뢰도 조회.",
+  {
+    section: z.enum(["all", "timeouts", "modes", "critics", "heuristic"]).optional().describe("Which section to view (default: all)"),
+  },
+  async (args) => {
+    try {
+      const section = args.section || "all";
+      let r;
+
+      if (section === "timeouts") {
+        r = await flask("/api/analytics/timeouts");
+        let t = `## Timeout Statistics (P50/P90/P99)\n\n`;
+        for (const [stage, stats] of Object.entries(r)) {
+          t += `**${stage}:** P50=${stats.p50}ms P90=${stats.p90}ms P99=${stats.p99}ms (n=${stats.count}) → recommended: ${stats.recommended_timeout_ms}ms\n`;
+        }
+        return { content: [{ type: "text", text: t || "No latency data yet. Run some tasks first." }] };
+
+      } else if (section === "modes") {
+        r = await flask("/api/analytics/modes");
+        let t = `## Mode Usage Stats\n\n`;
+        for (const [mode, stats] of Object.entries(r)) {
+          t += `**${mode}:** ${stats.usage_count} runs | avg_score=${stats.avg_score} | avg_latency=${Math.round(stats.avg_latency_ms)}ms | convergence=${(stats.convergence_rate * 100).toFixed(0)}%\n`;
+        }
+        return { content: [{ type: "text", text: t || "No mode data yet." }] };
+
+      } else if (section === "critics") {
+        r = await flask("/api/analytics/critics");
+        let t = `## Critic Reliability\n\n`;
+        for (const [model, stats] of Object.entries(r)) {
+          t += `**${model}:** reliability=${stats.reliability_score} | weight=${stats.recommended_weight} | reviews=${stats.total_reviews} | avg_delta=${stats.avg_score_delta}\n`;
+        }
+        return { content: [{ type: "text", text: t || "No critic data yet." }] };
+
+      } else if (section === "heuristic") {
+        r = await flask("/api/analytics/heuristic");
+        let t = `## Heuristic Refinement Suggestions\n\n`;
+        for (const s of (r.suggestions || [])) {
+          t += `- ${s}\n`;
+        }
+        return { content: [{ type: "text", text: t || "No suggestions yet. Need more run data." }] };
+
+      } else {
+        // all
+        r = await flask("/api/analytics");
+        let t = `## Horcrux Analytics Dashboard\n\n`;
+        t += `**Total sessions:** ${r.total_sessions || 0} | **Total stages logged:** ${r.total_stages_logged || 0}\n\n`;
+
+        t += `### Mode Usage\n`;
+        for (const [mode, stats] of Object.entries(r.mode_stats || {})) {
+          t += `- ${mode}: ${stats.usage_count} runs, avg=${stats.avg_score}/10, ${Math.round(stats.avg_latency_ms)}ms\n`;
+        }
+
+        t += `\n### Timeout Recommendations\n`;
+        for (const [key, val] of Object.entries(r.timeout_recommendations || {})) {
+          t += `- ${key}: ${val}ms\n`;
+        }
+
+        t += `\n### Critic Reliability\n`;
+        for (const [model, stats] of Object.entries(r.critic_reliability || {})) {
+          t += `- ${model}: reliability=${stats.reliability_score}, weight=${stats.recommended_weight}\n`;
+        }
+
+        const suggestions = r.heuristic_refinements?.suggestions || [];
+        if (suggestions.length) {
+          t += `\n### Heuristic Suggestions\n`;
+          for (const s of suggestions) t += `- ${s}\n`;
+        }
+
+        return { content: [{ type: "text", text: t }] };
+      }
+    } catch (e) {
+      return { content: [{ type: "text", text: "Error: " + e.message }] };
+    }
+  }
+);
+
+// ─── 5. horcrux_test: AI 연결 테스트 ───
+server.tool("horcrux_test",
+  "AI 연결 테스트 (Claude, Codex)",
   {},
   async () => {
     try {
@@ -234,147 +346,12 @@ server.tool("debate_test",
   }
 );
 
-// ─── 하위 호환: 기존 도구들 유지 ───
-
-server.tool("debate_start",
-  "Start a debate (legacy). Use 'run' tool instead.",
-  { task: z.string(), max_rounds: z.number().optional(), threshold: z.number().optional() },
-  async (args) => {
-    try {
-      const r = await flask("/api/start", "POST", {
-        task: args.task, max_rounds: args.max_rounds || 5, threshold: args.threshold || 8.0
-      });
-      if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
-      return { content: [{ type: "text", text: `debate_id: ${r.debate_id}\nUse check("${r.debate_id}") or debate_status("${r.debate_id}") to monitor.` }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "server.py not running: " + e.message }] };
-    }
-  }
-);
-
-server.tool("debate_status",
-  "Check debate status (legacy). Use 'check' tool instead.",
-  { debate_id: z.string() },
-  async (args) => {
-    try {
-      const r = await flask("/api/status/" + args.debate_id);
-      if (r.error) return { content: [{ type: "text", text: "Not found" }] };
-      const done = r.status !== "running";
-      let t = `status: ${r.status} | Round: ${r.round} | Score: ${(r.avg_score || 0).toFixed(1)}/10 | phase: ${r.phase || "-"}`;
-      if (done) t += `\n\nDone! Use check("${args.debate_id}") to get the full solution.`;
-      return { content: [{ type: "text", text: t }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "Error: " + e.message }] };
-    }
-  }
-);
-
-server.tool("debate_result",
-  "Get debate result (legacy). Use 'check' tool instead.",
-  { debate_id: z.string() },
-  async (args) => {
-    try {
-      const status = await flask("/api/status/" + args.debate_id);
-      if (status.error) return { content: [{ type: "text", text: "Not found" }] };
-      if (status.status === "running") {
-        return { content: [{ type: "text", text: `Still running R${status.round} ${(status.avg_score || 0).toFixed(1)}/10 — check again later.` }] };
-      }
-      const res = await flask("/api/result/" + args.debate_id);
-      let t = `## ${res.status === "converged" ? "✅ Converged" : "⚠️ " + res.status}\n`;
-      t += `Rounds: ${res.round} | Score: ${(res.avg_score || 0).toFixed(1)}/10\n\n`;
-      const msgs = res.messages || [];
-      const lastGenIdx = msgs.reduce((li, m, i) => m.role === "generator" ? i : li, 0);
-      for (const m of msgs.slice(lastGenIdx)) {
-        t += `**${m.role}**`;
-        if (m.score !== undefined) t += ` (${m.score.toFixed(1)}/10)`;
-        t += `\n${(m.content || "").slice(0, 2000)}\n\n`;
-      }
-      if (res.final_solution) t += `## Final Solution\n${res.final_solution.slice(0, 4000)}`;
-      if (t.length > 10000) t = t.slice(0, 10000) + "\n\n[...truncated]";
-      return { content: [{ type: "text", text: t }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "Error: " + e.message }] };
-    }
-  }
-);
-
-server.tool("pair2_start",
-  "2-AI parallel gen (legacy). Use 'run' with mode='pair2' instead.",
-  { task: z.string(), context: z.string().optional() },
-  async (args) => {
-    try {
-      const r = await flask("/api/pair", "POST", { task: args.task, mode: "pair2", context: args.context || "" });
-      if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
-      return { content: [{ type: "text", text: `pair_id: ${r.pair_id}\nUse check("${r.pair_id}") to monitor.` }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "server.py not running: " + e.message }] };
-    }
-  }
-);
-
-server.tool("pair3_start",
-  "3-AI parallel gen (legacy). Use 'run' with mode='pair3' instead.",
-  { task: z.string(), context: z.string().optional() },
-  async (args) => {
-    try {
-      const r = await flask("/api/pair", "POST", { task: args.task, mode: "pair3", context: args.context || "" });
-      if (r.error) return { content: [{ type: "text", text: "Error: " + r.error }] };
-      return { content: [{ type: "text", text: `pair_id: ${r.pair_id}\nUse check("${r.pair_id}") to monitor.` }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "server.py not running: " + e.message }] };
-    }
-  }
-);
-
-server.tool("pair_status",
-  "Check pair status (legacy). Use 'check' tool instead.",
-  { pair_id: z.string() },
-  async (args) => {
-    try {
-      const r = await flask("/api/pair/status/" + args.pair_id);
-      if (r.error) return { content: [{ type: "text", text: "Not found" }] };
-      const done = r.status !== "running";
-      let t = `status: ${r.status} | phase: ${r.phase} | parts_done: ${r.parts_done || 0}`;
-      if (done) t += `\n\nDone! Use check("${args.pair_id}") to get the full result.`;
-      return { content: [{ type: "text", text: t }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "Error: " + e.message }] };
-    }
-  }
-);
-
-server.tool("pair_result",
-  "Get pair result (legacy). Use 'check' tool instead.",
-  { pair_id: z.string() },
-  async (args) => {
-    try {
-      const status = await flask("/api/pair/status/" + args.pair_id);
-      if (status.error) return { content: [{ type: "text", text: "Not found" }] };
-      if (status.status === "running") {
-        return { content: [{ type: "text", text: `Still running phase=${status.phase} — check again later.` }] };
-      }
-      const res = await flask("/api/pair/result/" + args.pair_id);
-      let t = `## Pair ${(res.mode || "").toUpperCase()} ${res.status}\n\n`;
-      t += `### Spec\n${res.spec || "N/A"}\n\n`;
-      for (const msg of (res.messages || [])) {
-        if (msg.role === "architect") continue;
-        t += `### ${msg.role} (${msg.model || "?"})\n${(msg.content || "").slice(0, 3000)}\n\n`;
-      }
-      if (t.length > 12000) t = t.slice(0, 12000) + "\n\n[...truncated]";
-      return { content: [{ type: "text", text: t }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "Error: " + e.message }] };
-    }
-  }
-);
-
 // ─── Main ───
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("MCP: debate-chain v7.0 connected\n");
-  process.stderr.write("  Tools: run, check, self_improve, debate_test\n");
-  process.stderr.write("  Legacy: debate_start/status/result, pair2/3_start, pair_status/result\n");
+  process.stderr.write("MCP: horcrux v8.0 connected\n");
+  process.stderr.write("  Tools: run, check, classify, analytics, horcrux_test\n");
 }
 
 main().catch(e => { process.stderr.write("MCP fatal: " + e.stack + "\n"); process.exit(1); });

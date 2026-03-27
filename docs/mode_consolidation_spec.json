@@ -1,0 +1,358 @@
+{
+  "document_type": "refactoring_spec_for_claude_code",
+  "title": "Horcrux 외부 인터페이스 통합 — Adaptive 단일 진입점 리팩토링",
+  "project_root": "D:\\Custom_AI-Agent_Project\\horcrux",
+  "date": "2026-03-27",
+
+  "problem": {
+    "summary": "외부에 노출되는 모드가 8개(debate, planning, pair2, pair3, debate_pair2, debate_pair3, adaptive, self_improve)로 너무 많고 겹침이 심함",
+    "overlaps": [
+      "debate ≈ adaptive full_horcrux (둘 다 멀티크리틱 수렴 루프)",
+      "planning ≈ adaptive + artifact (둘 다 3AI 생성→synth→critic)",
+      "debate_pair2/3 = debate + pair 체이닝 (조합일 뿐 독립 모드 불필요)",
+      "self_improve ≈ adaptive revision loop의 변형"
+    ],
+    "user_confusion": "사용자가 '브레인스토밍해줘'라고 했을 때 planning? debate? adaptive? 뭘 써야 하는지 모름"
+  },
+
+  "solution": {
+    "principle": "외부 진입점은 run 하나. 내부 코어 엔진은 그대로 두되, 사용자에게는 adaptive 라우팅만 노출. classify가 task를 분석해서 내부적으로 어떤 엔진을 쓸지 자동 결정.",
+    "user_experience": "사용자는 그냥 자연어로 말하면 됨. '이 코드 수정해줘', '브레인스토밍해줘', 'PPT 만들어줘' → Horcrux가 알아서 최적 경로로 라우팅",
+    "external_modes_after": ["auto (기본, 자동 분류)", "fast (수동 override)", "standard (수동 override)", "full (수동 override)", "parallel (pair2/3, 비판 없이 순수 병렬 생성)"],
+    "internal_engines_unchanged": ["debate loop (server.py run_debate)", "planning pipeline (planning_v2.py)", "pair generation (server.py run_pair)", "self_improve loop (server.py run_self_improve)", "adaptive orchestrator (adaptive_orchestrator.py)"]
+  },
+
+  "classification_enhancement": {
+    "purpose": "classify_task_complexity()가 mode뿐 아니라 internal engine까지 결정하도록 확장",
+    "file": "core/adaptive/classifier.py",
+    "current_output": {
+      "recommended_mode": "fast|standard|full_horcrux",
+      "routing_source": "override|heuristic|llm_fallback|safe_default",
+      "reason": "string",
+      "confidence": "float"
+    },
+    "new_output": {
+      "recommended_mode": "fast|standard|full|parallel",
+      "internal_engine": "adaptive_fast|adaptive_standard|adaptive_full|debate_loop|planning_pipeline|pair_generation|self_improve",
+      "routing_source": "override|heuristic|llm_fallback|safe_default",
+      "reason": "string",
+      "confidence": "float",
+      "detected_intent": "code_fix|feature_add|refactor|brainstorm|document|artifact|parallel_gen|self_improve"
+    },
+    "intent_detection_heuristics": {
+      "brainstorm_keywords": ["brainstorm", "아이디어", "ideas", "생각", "방향", "전략", "strategy", "plan", "기획"],
+      "artifact_keywords": ["ppt", "pdf", "presentation", "문서", "보고서", "report", "슬라이드", "포트폴리오"],
+      "parallel_keywords": ["병렬", "parallel", "pair", "동시에", "나눠서", "분할"],
+      "self_improve_keywords": ["개선", "improve", "반복", "iterate", "다듬어", "polish"],
+      "refactor_keywords": ["refactor", "리팩토링", "architecture", "아키텍처", "재설계", "redesign"],
+      "code_fix_keywords": ["fix", "bug", "typo", "수정", "오류", "에러", "rename"]
+    },
+    "routing_rules": [
+      "brainstorm intent + no artifact → internal_engine=planning_pipeline, mode=standard",
+      "brainstorm intent + artifact(ppt/pdf) → internal_engine=planning_pipeline, mode=full",
+      "artifact intent → internal_engine=planning_pipeline (artifact_only), mode=standard|full",
+      "code_fix + small scope → internal_engine=adaptive_fast, mode=fast",
+      "feature_add → internal_engine=adaptive_standard, mode=standard",
+      "refactor/architecture → internal_engine=adaptive_full, mode=full",
+      "parallel intent → internal_engine=pair_generation, mode=parallel",
+      "self_improve intent → internal_engine=self_improve, mode=standard",
+      "high risk + any → mode escalate to full"
+    ]
+  },
+
+  "mcp_server_js_refactor": {
+    "file": "mcp_server.js",
+    "version": "8.0",
+    "principle": "도구 수를 최소화. 메인 도구 3개 + 유틸 2개 = 총 5개. 레거시 도구 전부 제거.",
+    "tools": [
+      {
+        "name": "run",
+        "description": "Horcrux 메인 실행. task만 넣으면 자동으로 최적 모드/엔진을 선택. 코드 수정, 브레인스토밍, 문서 작성, PPT 생성, 아키텍처 설계 등 모든 작업을 이 도구 하나로 처리. 수동 모드 지정도 가능(fast/standard/full/parallel).",
+        "params": {
+          "task": "string (required) — 자연어 task 설명",
+          "mode": "auto|fast|standard|full|parallel (optional, default=auto)",
+          "scope": "small|medium|large (optional, auto-detected if omitted)",
+          "risk": "low|medium|high (optional, auto-detected if omitted)",
+          "artifact_type": "none|ppt|pdf|doc (optional, auto-detected from task)",
+          "output_dir": "string (optional, parallel mode only — 파일 자동 저장 경로)",
+          "project_dir": "string (optional — 프로젝트 코드를 context로 활용)",
+          "audience": "string (optional — 문서/PPT 타겟 독자)",
+          "tone": "string (optional — professional/casual/technical)",
+          "iterations": "number (optional — self_improve 횟수, 자동 감지 시 사용)"
+        },
+        "internal_routing": "classify_task_complexity() → internal_engine 결정 → 해당 엔진 호출",
+        "flask_endpoint": "/api/horcrux/run"
+      },
+      {
+        "name": "check",
+        "description": "실행 중인 job 상태 확인. 완료 시 자동으로 결과 포함.",
+        "params": {
+          "job_id": "string (required)"
+        },
+        "note": "기존 check와 동일. debate/pair/planning/self_improve 모든 job_id 대응.",
+        "flask_endpoints": "기존 /api/status, /api/pair/status, /api/planning/status 등 그대로 사용"
+      },
+      {
+        "name": "classify",
+        "description": "task 난이도/의도를 미리보기. 실행하지 않고 어떤 모드/엔진이 선택될지 확인.",
+        "params": {
+          "task": "string (required)",
+          "scope": "small|medium|large (optional)",
+          "risk": "low|medium|high (optional)"
+        },
+        "flask_endpoint": "/api/horcrux/classify"
+      },
+      {
+        "name": "analytics",
+        "description": "운영 데이터 대시보드. timeout 통계, 모드별 성능, critic 신뢰도 조회.",
+        "params": {
+          "section": "all|timeouts|modes|critics|heuristic (optional, default=all)"
+        },
+        "flask_endpoints": "기존 /api/analytics/* 그대로 사용"
+      },
+      {
+        "name": "horcrux_test",
+        "description": "AI 연결 테스트 (Claude, Codex)",
+        "params": {},
+        "flask_endpoint": "/api/test"
+      }
+    ],
+    "removed_tools": [
+      "debate_start (→ run으로 흡수)",
+      "debate_status (→ check로 흡수)",
+      "debate_result (→ check로 흡수)",
+      "pair2_start (→ run mode=parallel로 흡수)",
+      "pair3_start (→ run mode=parallel로 흡수)",
+      "pair_status (→ check로 흡수)",
+      "pair_result (→ check로 흡수)",
+      "self_improve (→ run이 자동 감지 또는 iterations 파라미터)"
+    ]
+  },
+
+  "flask_api_refactor": {
+    "file": "server.py",
+    "new_unified_endpoint": {
+      "path": "/api/horcrux/run",
+      "method": "POST",
+      "description": "통합 실행 엔드포인트. classify → engine 결정 → 해당 엔진 호출",
+      "request_body": {
+        "task": "string (required)",
+        "mode": "auto|fast|standard|full|parallel (default: auto)",
+        "scope": "string (optional)",
+        "risk": "string (optional)",
+        "artifact_type": "string (optional)",
+        "output_dir": "string (optional)",
+        "project_dir": "string (optional)",
+        "audience": "string (optional)",
+        "tone": "string (optional)",
+        "iterations": "number (optional)"
+      },
+      "handler_logic": [
+        "1. classify_task_complexity(task, ...) → mode + internal_engine + detected_intent",
+        "2. switch(internal_engine):",
+        "   adaptive_fast → adaptive_orchestrator._run_fast()",
+        "   adaptive_standard → adaptive_orchestrator._run_standard()",
+        "   adaptive_full → adaptive_orchestrator._run_full_horcrux()",
+        "   planning_pipeline → 기존 /api/planning 로직 호출 (비동기, job_id 반환)",
+        "   pair_generation → 기존 /api/pair 로직 호출 (비동기, job_id 반환)",
+        "   self_improve → 기존 /api/self_improve 로직 호출 (비동기, job_id 반환)",
+        "   debate_loop → 기존 /api/start 로직 호출 (비동기, job_id 반환)",
+        "3. 동기 엔진(adaptive_*)은 결과 직접 반환",
+        "4. 비동기 엔진(planning/pair/debate/self_improve)은 job_id 반환 → check로 폴링"
+      ],
+      "response_format": {
+        "sync_response": {
+          "status": "completed|converged",
+          "mode": "fast|standard|full",
+          "internal_engine": "adaptive_fast|adaptive_standard|adaptive_full",
+          "score": 0,
+          "rounds": 0,
+          "solution": "string",
+          "routing": {"source": "string", "confidence": 0, "intent": "string"}
+        },
+        "async_response": {
+          "status": "running",
+          "job_id": "string",
+          "internal_engine": "planning_pipeline|pair_generation|debate_loop|self_improve",
+          "message": "Use check(job_id) to monitor"
+        }
+      }
+    },
+    "new_classify_endpoint": {
+      "path": "/api/horcrux/classify",
+      "method": "POST",
+      "description": "분류 미리보기",
+      "response": {
+        "recommended_mode": "string",
+        "internal_engine": "string",
+        "detected_intent": "string",
+        "confidence": 0,
+        "reason": "string",
+        "stages": ["string"]
+      }
+    },
+    "keep_existing_endpoints": [
+      "/api/start (debate — 내부적으로 /api/horcrux/run에서 호출됨)",
+      "/api/status/<id>, /api/result/<id>",
+      "/api/pair, /api/pair/status, /api/pair/result",
+      "/api/planning, /api/planning/status, /api/planning/result",
+      "/api/self_improve, /api/self_improve/status, /api/self_improve/result",
+      "/api/analytics/* (전부 유지)",
+      "/api/test",
+      "/api/threads, /api/delete, /api/timing"
+    ],
+    "remove_endpoints": [
+      "/api/adaptive/classify (→ /api/horcrux/classify로 대체)",
+      "/api/adaptive/run (→ /api/horcrux/run으로 대체)",
+      "/api/adaptive/config (→ /api/analytics로 통합)"
+    ]
+  },
+
+  "main_ui_refactor": {
+    "file": "server.py 내 HTML_TEMPLATE",
+    "principle": "mode switcher를 5개로 단순화. 기본은 Auto.",
+    "mode_buttons": [
+      {"id": "modeAuto", "label": "Auto", "gradient": "linear-gradient(135deg, #bc8cff, #58a6ff)", "description": "task를 분석해서 최적 경로 자동 선택", "default": true},
+      {"id": "modeFast", "label": "Fast", "gradient": "linear-gradient(135deg, #3fb950, #2ea043)", "description": "간단한 수정, 저위험"},
+      {"id": "modeStandard", "label": "Standard", "gradient": "linear-gradient(135deg, #d29922, #e3b341)", "description": "중간 복잡도, pair gen + critic"},
+      {"id": "modeFull", "label": "Full", "gradient": "linear-gradient(135deg, #f85149, #da3633)", "description": "고난도, 풀체인 + aux critic"},
+      {"id": "modeParallel", "label": "Parallel", "gradient": "linear-gradient(135deg, #58a6ff, #388bfd)", "description": "비판 없이 2~3 AI 병렬 생성"}
+    ],
+    "option_panels": {
+      "common_options": {
+        "show_always": true,
+        "elements": [
+          {"id": "claudeModel", "type": "select", "options": ["auto", "opus", "sonnet"], "label": "Claude Model"}
+        ]
+      },
+      "auto_mode_options": {
+        "show_when": "curMode === 'auto'",
+        "elements": [
+          {"id": "autoScope", "type": "select", "options": ["auto", "small", "medium", "large"], "default": "auto", "label": "Scope"},
+          {"id": "autoRisk", "type": "select", "options": ["auto", "low", "medium", "high"], "default": "auto", "label": "Risk"},
+          {"id": "autoArtifact", "type": "select", "options": ["none", "ppt", "pdf", "doc"], "default": "none", "label": "Artifact"}
+        ]
+      },
+      "parallel_options": {
+        "show_when": "curMode === 'parallel'",
+        "elements": [
+          {"id": "parallelParts", "type": "select", "options": ["2", "3"], "default": "2", "label": "Parts"},
+          {"id": "outputDir", "type": "text", "placeholder": "D:\\project\\output", "label": "Output Dir"}
+        ]
+      },
+      "full_mode_options": {
+        "show_when": "curMode === 'full'",
+        "elements": [
+          {"id": "fullArtifact", "type": "select", "options": ["none", "ppt", "pdf", "doc"], "default": "none", "label": "Artifact"},
+          {"id": "fullAudience", "type": "text", "default": "general", "label": "Audience"},
+          {"id": "fullTone", "type": "select", "options": ["professional", "casual", "technical"], "default": "professional", "label": "Tone"}
+        ]
+      }
+    },
+    "js_changes": {
+      "setMode": "5개 모드만 지원. 옵션 패널 토글.",
+      "startDebate_renamed_to": "startRun",
+      "startRun_logic": [
+        "모든 모드 → /api/horcrux/run 하나로 호출",
+        "mode=auto → scope/risk/artifact를 body에 포함",
+        "mode=parallel → pair_mode=pair2|pair3 + output_dir",
+        "mode=fast|standard|full → mode_override로 전달",
+        "응답이 sync(solution 포함)면 바로 렌더링",
+        "응답이 async(job_id)면 기존 polling 로직 사용"
+      ],
+      "poll_logic": "기존 poll() 그대로 유지 — check 엔드포인트 사용"
+    }
+  },
+
+  "prompting_guide": {
+    "purpose": "사용자가 Claude Desktop에서 어떻게 프롬프팅하면 되는지",
+    "principle": "사용자는 모드를 몰라도 됨. 자연어로 말하면 Horcrux가 자동 라우팅.",
+    "examples": [
+      {
+        "user_says": "이 코드 typo 수정해줘",
+        "what_happens": "run tool → classify → fast → adaptive_fast → 즉시 결과",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "브레인스토밍해줘, AI 기반 추천 시스템 아이디어",
+        "what_happens": "run tool → classify → standard + brainstorm intent → planning_pipeline → job_id → check로 폴링",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "포트폴리오 PPT 만들어줘",
+        "what_happens": "run tool → classify → full + artifact=ppt → planning_pipeline(artifact) → job_id",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "이 프로젝트 아키텍처 리팩토링해줘",
+        "what_happens": "run tool → classify → full → adaptive_full → 2라운드 debate",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "이 코드 3개 AI로 동시에 만들어줘",
+        "what_happens": "run tool → classify → parallel intent → pair_generation(pair3)",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "이 솔루션 3번 반복해서 개선해줘",
+        "what_happens": "run tool → classify → self_improve intent → self_improve(iterations=3)",
+        "user_needs_to_know": "nothing"
+      },
+      {
+        "user_says": "fast 모드로 이것만 빠르게 처리해줘",
+        "what_happens": "run tool → mode=fast override → adaptive_fast",
+        "user_needs_to_know": "mode 이름을 알면 수동 override 가능"
+      }
+    ],
+    "mcp_tool_description_importance": "Claude Desktop은 tool description을 보고 어떤 도구를 호출할지 결정함. run 도구의 description이 '코드 수정, 브레인스토밍, 문서 작성, PPT 생성, 아키텍처 설계 등 모든 작업'이라고 명시돼있으면 사용자가 뭘 말해도 이 도구로 라우팅됨."
+  },
+
+  "implementation_order": [
+    "1. classifier.py 확장 — detected_intent + internal_engine 필드 추가, intent detection heuristics 추가",
+    "2. server.py — /api/horcrux/run, /api/horcrux/classify 엔드포인트 추가 (기존 엔드포인트는 유지)",
+    "3. mcp_server.js v8.0 — 도구 5개로 축소, run에 통합 라우팅 로직",
+    "4. HTML_TEMPLATE — mode switcher 5개로 변경, 옵션 패널, startRun() JS",
+    "5. 기존 /api/adaptive/* 엔드포인트 제거 (horcrux로 대체됨)",
+    "6. adaptive_routes.py, run_server.py 삭제",
+    "7. 테스트: 각 intent별 자연어 프롬프트로 올바른 engine이 선택되는지 확인"
+  ],
+
+  "files_to_modify": [
+    "core/adaptive/classifier.py — intent detection + internal_engine 확장",
+    "server.py — /api/horcrux/run, /api/horcrux/classify 추가 + HTML_TEMPLATE mode switcher 변경",
+    "mcp_server.js — v8.0 도구 5개로 축소"
+  ],
+
+  "files_to_delete": [
+    "adaptive_routes.py",
+    "run_server.py",
+    "mcp_adaptive_ext.py (JS MCP로 통합됨)"
+  ],
+
+  "files_unchanged": [
+    "core/adaptive/ 패키지 전체 (classifier.py 확장 제외)",
+    "adaptive_orchestrator.py",
+    "orchestrator.py",
+    "planning_v2.py",
+    "config.json"
+  ],
+
+  "critical_rules": [
+    "내부 코어 엔진(run_debate, run_pair, run_planning, run_self_improve)은 절대 수정하지 않음",
+    "기존 /api/start, /api/pair, /api/planning 등 엔드포인트는 유지 (내부적으로 호출됨)",
+    "server.py는 100KB라 전체를 다시 쓰지 말고 필요한 부분만 추가/수정",
+    "mcp_server.js는 전체 재작성 OK (현재 400줄, 레거시 제거하면 200줄로 줄어듦)",
+    "classify의 intent detection은 heuristic-first (LLM 호출 금지, 즉시 반환)"
+  ],
+
+  "test_scenarios": [
+    {"input": "fix typo in README", "expected_mode": "fast", "expected_engine": "adaptive_fast"},
+    {"input": "add user auth endpoint", "expected_mode": "standard", "expected_engine": "adaptive_standard"},
+    {"input": "refactor architecture to microservices", "expected_mode": "full", "expected_engine": "adaptive_full"},
+    {"input": "브레인스토밍해줘 AI 추천 시스템", "expected_mode": "standard", "expected_engine": "planning_pipeline"},
+    {"input": "포트폴리오 PPT 만들어줘", "expected_mode": "full", "expected_engine": "planning_pipeline"},
+    {"input": "3개 AI로 동시에 코드 생성해줘", "expected_mode": "parallel", "expected_engine": "pair_generation"},
+    {"input": "이 솔루션 3번 개선해줘", "expected_mode": "standard", "expected_engine": "self_improve"},
+    {"input": "보안 취약점 분석해줘 프로덕션 코드", "expected_mode": "full", "expected_engine": "adaptive_full"}
+  ]
+}

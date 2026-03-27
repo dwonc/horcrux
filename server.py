@@ -1,8 +1,8 @@
 """
-Debate Chain Web Server v7
-Phase 1: subprocess 보안 수정 (shell=False + stdin 직접, temp file 제거)
-Phase 2: Multi-Critic(Codex+Gemini 병렬) + Synthesizer 모델 분리 + Regression detection + 다차원 수렴
-Phase 3: debate_pair 파이프라인 + self_improve + SSE 스트리밍
+Horcrux Web Server v8
+Adaptive 단일 진입점 — /api/horcrux/run 통합 엔드포인트
+External modes: Auto / Fast / Standard / Full / Parallel
+Internal engines: adaptive_fast/standard/full, debate_loop, planning_pipeline, pair_generation, self_improve
 """
 import json
 import subprocess
@@ -11,6 +11,7 @@ import re
 import time
 import threading
 import concurrent.futures
+from planning_v2 import register_planning_v2_routes
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, Response
@@ -37,7 +38,7 @@ _gemini_lock = threading.Lock()
 GENERATOR_PROMPT = """Task: {task}
 
 Reply JSON only:
-{{"solution":"<complete code/text>","approach":"<1 sentence>","decisions":["d1","d2"]}}"""
+{{"solution":"<complete code/text>","approach":"<1 sentence>","decisions":["d1","d2"],"rejected_alternatives":["considered but rejected approach 1","considered but rejected approach 2"]}}"""
 
 GENERATOR_IMPROVE_PROMPT = """Task: {task}
 
@@ -52,6 +53,37 @@ Previously fixed issues (do NOT regress):
 
 Reply JSON only:
 {{"solution":"<improved complete solution>","approach":"<1 sentence>","changes":["fix1","fix2"]}}"""
+
+# v5.2: blocker 중심 revise 프롬프트 (compact context package 사용)
+GENERATOR_IMPROVE_PROMPT_V2 = """Task: {task}
+
+Current solution:
+{solution}
+
+## Blocking Issues (fix these FIRST)
+{blocking_issues}
+
+## Regressions (must eliminate)
+{regressions}
+
+## Worst Dimensions
+{worst_dimensions}
+
+## Critic Disagreements
+{critic_disagreements}
+
+## Alternative Approaches (consider reactivating if current approach fails)
+{alternative_views}
+
+## PRESERVE (do NOT change these — already passing)
+{preserve}
+
+## Previously fixed issues (do NOT regress)
+{previously_fixed}
+
+Focus on fixing the blocking issues first. Do NOT rewrite passing areas.
+Reply JSON only:
+{{"solution":"<improved complete solution>","approach":"<1 sentence>","changes":["fix1","fix2"],"rejected_alternatives":["alt considered but not used"]}}"""
 
 # Phase 2: 다차원 수렴 Critic 프롬프트
 CRITIC_PROMPT = """Task: {task}
@@ -189,27 +221,279 @@ def extract_score(data, raw_text):
 
 
 def check_convergence(critic_data, threshold=8.0, min_per_dim=6.0):
-    """Phase 2: 다차원 수렴 판정"""
-    overall = critic_data.get("overall", critic_data.get("score", 0))
-    if overall < threshold:
-        return False, f"overall {overall} < {threshold}"
+    """Phase 2: 다차원 수렴 판정 (레거시 — run_debate 하위호환용)"""
+    result = check_convergence_v2(critic_data, threshold, min_per_dim)
+    return result["converged"], result.get("reason", "converged")
 
+
+# ═══════════════════════════════════════════
+# v5.2: CRITIC SCHEMA NORMALIZATION + CONVERGENCE DIAGNOSTICS + REVISION FOCUS
+# ═══════════════════════════════════════════
+
+# severity 매핑 테이블
+_SEV_MAP = {
+    "critical": "critical", "blocker": "critical", "fatal": "critical",
+    "major": "major", "high": "major", "important": "major",
+    "minor": "minor", "low": "minor", "trivial": "minor", "info": "minor",
+}
+
+
+def normalize_critic_output(raw_data: dict, source: str = "") -> dict:
+    """Step 1: 모델별 critic raw output → 공통 내부 schema 변환.
+    
+    모든 critic(Core+Aux)이 동일 형식으로 처리되어 집계/비교/자동화 가능.
+    """
+    if not raw_data or not isinstance(raw_data, dict):
+        return {"model": source, "score": 5.0, "dimension_scores": {},
+                "issues": [], "regressions": [], "top_fixes": [],
+                "verdict": "revise", "confidence": 0.0}
+
+    # score
+    score = 5.0
+    for key in ("overall", "score"):
+        if key in raw_data:
+            try:
+                v = float(raw_data[key])
+                if 0 < v <= 10: score = v; break
+            except: pass
+
+    # dimension_scores
+    dim_scores = {}
+    raw_dims = raw_data.get("scores", raw_data.get("dimension_scores", {}))
+    for dim in ["correctness", "completeness", "security", "performance"]:
+        v = raw_dims.get(dim)
+        if v is not None:
+            try: dim_scores[dim] = float(v)
+            except: dim_scores[dim] = 5.0
+
+    # issues 정규화
+    normalized_issues = []
+    raw_issues = raw_data.get("issues", [])
+    for i, iss in enumerate(raw_issues):
+        if not isinstance(iss, dict):
+            normalized_issues.append({
+                "id": f"{source}_i{i}", "severity": "major",
+                "dimension": "completeness", "summary": str(iss),
+                "evidence": "", "fix_hint": "", "source": source,
+            })
+            continue
+        raw_sev = iss.get("sev", iss.get("severity", "major")).lower().strip()
+        severity = _SEV_MAP.get(raw_sev, "major")
+        normalized_issues.append({
+            "id": f"{source}_i{i}",
+            "severity": severity,
+            "dimension": iss.get("dimension", "completeness"),
+            "summary": iss.get("desc", iss.get("summary", iss.get("description", str(iss)))),
+            "evidence": iss.get("evidence", ""),
+            "fix_hint": iss.get("fix", iss.get("fix_hint", iss.get("suggestion", ""))),
+            "source": source,
+        })
+
+    # regressions 정규화
+    raw_reg = raw_data.get("regressions", [])
+    regressions = []
+    for r in raw_reg:
+        if not r or r == "<regressed issue if any>":
+            continue
+        if isinstance(r, dict):
+            regressions.append(r)
+        else:
+            regressions.append({"id": f"{source}_reg", "summary": str(r), "evidence": "", "fix_hint": ""})
+
+    # top_fixes 추출 (critical → major 순 fix_hint)
+    top_fixes = []
+    for iss in sorted(normalized_issues, key=lambda x: {"critical": 0, "major": 1, "minor": 2}.get(x["severity"], 3)):
+        hint = iss.get("fix_hint", "")
+        if hint and hint not in top_fixes:
+            top_fixes.append(hint)
+        if len(top_fixes) >= 5:
+            break
+
+    # verdict
+    has_critical = any(i["severity"] == "critical" for i in normalized_issues)
+    if score >= 8.0 and not has_critical and not regressions:
+        verdict = "accept"
+    elif score < 4.0 or len([i for i in normalized_issues if i["severity"] == "critical"]) >= 3:
+        verdict = "reject"
+    else:
+        verdict = "revise"
+
+    return {
+        "model": source,
+        "score": round(score, 1),
+        "dimension_scores": dim_scores,
+        "issues": normalized_issues,
+        "regressions": regressions,
+        "top_fixes": top_fixes,
+        "verdict": verdict,
+        "confidence": round(min(score / 10.0, 1.0), 2),
+        "summary": raw_data.get("summary", ""),
+        "strengths": raw_data.get("strengths", []),
+    }
+
+
+def check_convergence_v2(critic_data, threshold=8.0, min_per_dim=6.0):
+    """Step 2: 구조화된 convergence diagnostics JSON 반환.
+    
+    문자열 대신 failed_checks/blocking_models/blocking_dimensions/next_action_focus를
+    JSON으로 반환하여 revise 프롬프트 자동 생성에 사용.
+    """
+    overall = critic_data.get("overall", critic_data.get("score", 0))
+    try: overall = float(overall)
+    except: overall = 0
+
+    failed_checks = []
+    blocking_dims = []
+    blocking_models = []
+    next_actions = []
+
+    # check 1: overall threshold
+    if overall < threshold:
+        failed_checks.append({"check": "overall_threshold", "expected": f">= {threshold}", "actual": overall})
+        next_actions.append(f"raise overall score from {overall} to >= {threshold}")
+
+    # check 2: dimension thresholds
     dims = critic_data.get("scores", {})
+    failing_dims = {}
     for dim, val in dims.items():
         try:
-            if float(val) < min_per_dim:
-                return False, f"{dim} {val} < {min_per_dim}"
+            v = float(val)
+            if v < min_per_dim:
+                failing_dims[dim] = v
+                blocking_dims.append(dim)
         except: pass
+    if failing_dims:
+        failed_checks.append({"check": "dimension_threshold", "expected": f"all >= {min_per_dim}", "actual": failing_dims})
+        for dim, val in failing_dims.items():
+            next_actions.append(f"raise {dim} from {val} to >= {min_per_dim}")
 
-    criticals = [i for i in critic_data.get("issues", []) if isinstance(i, dict) and i.get("sev") == "critical"]
+    # check 3: critical issues
+    issues = critic_data.get("issues", [])
+    criticals = [i for i in issues if isinstance(i, dict) and
+                 i.get("severity", i.get("sev", "")).lower() in ("critical", "blocker")]
     if criticals:
-        return False, f"{len(criticals)} critical issues remain"
+        failed_checks.append({"check": "critical_issues", "expected": 0, "actual": len(criticals)})
+        for c in criticals[:3]:
+            desc = c.get("summary", c.get("desc", str(c)))
+            next_actions.append(f"resolve critical: {desc[:80]}")
 
+    # check 4: regressions
     regressions = critic_data.get("regressions", [])
-    if regressions and regressions != ["<regressed issue if any>"]:
-        return False, f"regressions: {regressions}"
+    real_reg = [r for r in regressions if r and (isinstance(r, dict) or r != "<regressed issue if any>")]
+    if real_reg:
+        failed_checks.append({"check": "regressions", "expected": 0, "actual": len(real_reg)})
+        next_actions.append("eliminate all regressions first")
 
-    return True, "converged"
+    # blocking model 식별 (core critic 중 가장 낮은 점수 모델)
+    critic_scores = critic_data.get("critic_scores", {})
+    if critic_scores:
+        min_model = min(critic_scores, key=critic_scores.get)
+        if critic_scores[min_model] < threshold:
+            blocking_models.append({"model": min_model, "reason": f"score {critic_scores[min_model]} < {threshold}"})
+
+    # preserve (통과한 차원)
+    good_dims = [dim for dim, val in dims.items() if dim not in blocking_dims]
+    if good_dims:
+        next_actions.append(f"preserve already passing: {', '.join(good_dims)}")
+
+    converged = len(failed_checks) == 0
+    reason = "converged" if converged else failed_checks[0].get("check", "unknown")
+
+    return {
+        "converged": converged,
+        "reason": reason,
+        "overall_score": overall,
+        "failed_checks": failed_checks,
+        "blocking_models": blocking_models,
+        "blocking_dimensions": blocking_dims,
+        "next_action_focus": next_actions[:5],
+        "passing_dimensions": good_dims if not converged else list(dims.keys()),
+    }
+
+
+def build_revision_focus(diagnostics, critic_merged):
+    """Step 3: convergence diagnostics + critic 결과에서 blocker만 추출.
+    
+    전체 이슈 대신 worst dimension + blocking issues만 revise에 전달하여
+    토큰 절약 + 수렴 속도 향상.
+    """
+    blocking_issues = []
+    for iss in critic_merged.get("issues", []):
+        sev = iss.get("severity", iss.get("sev", "minor"))
+        if sev in ("critical", "blocker"):
+            blocking_issues.append(iss)
+
+    # critical 없으면 worst dimension의 major 이슈 추가
+    if not blocking_issues:
+        worst_dims = diagnostics.get("blocking_dimensions", [])
+        for iss in critic_merged.get("issues", []):
+            sev = iss.get("severity", iss.get("sev", "minor"))
+            dim = iss.get("dimension", "")
+            if sev == "major" and (dim in worst_dims or not worst_dims):
+                blocking_issues.append(iss)
+                if len(blocking_issues) >= 5:
+                    break
+
+    return {
+        "overall_score": diagnostics.get("overall_score", 0),
+        "worst_dimensions": diagnostics.get("blocking_dimensions", []),
+        "blocking_issues": blocking_issues[:5],
+        "regressions": critic_merged.get("regressions", []),
+        "top_fixes": diagnostics.get("next_action_focus", [])[:5],
+        "preserve": diagnostics.get("passing_dimensions", []),
+        "instruction_style": "fix_only_blockers_first",
+    }
+
+
+def build_compact_context_package(solution_summary, critic_merged, diagnostics, generator_data=None):
+    """Step 4: full context dump 대신 편향 완화용 compact context package 생성.
+    
+    solution_summary + blocking_issues + critic_disagreements + alternative_views
+    + preserve + must_not_change 조합으로 anchor bias를 줄임.
+    """
+    # critic disagreements: 점수 차이가 큰 모델 간 의견 충돌
+    disagreements = []
+    critic_scores = critic_merged.get("critic_scores", {})
+    if len(critic_scores) >= 2:
+        scores_list = list(critic_scores.items())
+        for i, (m1, s1) in enumerate(scores_list):
+            for m2, s2 in scores_list[i+1:]:
+                if abs(s1 - s2) >= 2.0:  # 2점 이상 차이
+                    disagreements.append(f"{m1}({s1:.1f}) vs {m2}({s2:.1f}): 점수 차이 {abs(s1-s2):.1f}점")
+
+    # issue source별 관점 차이
+    source_issues = {}
+    for iss in critic_merged.get("issues", []):
+        src = iss.get("source", "unknown")
+        if src not in source_issues:
+            source_issues[src] = []
+        source_issues[src].append(iss.get("summary", iss.get("desc", ""))[:60])
+    for src, issues in source_issues.items():
+        if issues:
+            disagreements.append(f"{src}: {issues[0]}")
+
+    # alternative_views: generator의 rejected_alternatives에서 가져오기
+    alternative_views = []
+    if generator_data and isinstance(generator_data, dict):
+        for alt in generator_data.get("rejected_alternatives", []):
+            if isinstance(alt, dict):
+                alternative_views.append(alt)
+            elif isinstance(alt, str) and alt:
+                alternative_views.append({"alternative": alt, "source": "generator"})
+
+    return {
+        "solution_summary": solution_summary[:2000] if solution_summary else "",
+        "blocking_issues": [iss.get("summary", iss.get("desc", ""))[:100]
+                           for iss in critic_merged.get("issues", [])
+                           if iss.get("severity", iss.get("sev", "")) in ("critical", "blocker")][:5],
+        "critical_issues": [iss.get("summary", iss.get("desc", ""))[:100]
+                           for iss in critic_merged.get("issues", [])
+                           if iss.get("severity", iss.get("sev", "")) == "critical"][:3],
+        "critic_disagreements": disagreements[:5],
+        "alternative_views": alternative_views[:5],
+        "preserve": diagnostics.get("passing_dimensions", []),
+        "must_not_change": ["core scoring philosophy", "previously resolved issues"],
+    }
 
 
 def extract_debate_artifact(state: dict) -> dict:
@@ -256,8 +540,14 @@ import platform
 import shutil
 
 _NPM = r"C:\Users\User\AppData\Roaming\npm"
-MAX_PROMPT_CHARS = 12000
-MAX_PROMPT_RETRY = 6000
+MAX_PROMPT_CHARS = 60000   # 50개 아이디어급 긴 컨텍스트 수용
+MAX_PROMPT_RETRY = 30000   # 타임아웃 재시도 시 프롬프트 절반으로 줄여서 재시도 (Claude/Gemini의 긴 프롬프트 처리 문제 완화)
+
+# ── Claude 모델 스위칭 ──
+CLAUDE_MODELS = {
+    "opus": "claude-opus-4-6",       # Max 구독
+    "sonnet": "claude-sonnet-4-6",   # Pro 구독
+}
 
 
 def _truncate_prompt(prompt: str, max_chars: int) -> str:
@@ -277,8 +567,8 @@ def _win(name: str) -> str:
     return f"{_NPM}\\{name}.cmd"
 
 
-def call_claude(prompt: str, timeout: int = 900) -> str:
-    """Claude CLI - stdin 방식. cwd=temp으로 실행해 프로젝트 파일 노출 차단."""
+def call_claude(prompt: str, timeout: int = 900, model: str = "") -> str:
+    """Claude CLI - stdin 방식. model 파라미터로 Opus/Sonnet 전환."""
     import tempfile
     prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
@@ -287,6 +577,8 @@ def call_claude(prompt: str, timeout: int = 900) -> str:
         else:
             exe = shutil.which("claude") or "claude"
             cmd = [exe, "-p"]
+        if model:
+            cmd.extend(["--model", model])
         r = subprocess.run(
             cmd,
             input=prompt,
@@ -303,8 +595,94 @@ def call_claude(prompt: str, timeout: int = 900) -> str:
     except Exception as e: return f"[ERROR] Claude: {str(e)[:500]}"
 
 
+def _call_openai_sdk(prompt: str, timeout: int = 180) -> str:
+    """Codex fallback 1순위: OpenAI SDK (GPT-4o-mini → GPT-4o)"""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return ""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        for model in ["gpt-4o-mini", "gpt-4o"]:
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=16000, timeout=timeout,
+                )
+                text = resp.choices[0].message.content or ""
+                if text.strip():
+                    print(f"[FALLBACK] Codex CLI → OpenAI SDK/{model}")
+                    return text.strip()
+            except Exception as e:
+                if any(kw in str(e).lower() for kw in ["rate", "quota", "billing"]):
+                    continue
+                raise
+    except ImportError:
+        try:
+            import requests as _req
+            for model in ["gpt-4o-mini", "gpt-4o"]:
+                try:
+                    r = _req.post("https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 16000},
+                        timeout=timeout)
+                    if r.status_code == 200:
+                        text = r.json()["choices"][0]["message"]["content"].strip()
+                        if text:
+                            print(f"[FALLBACK] Codex CLI → OpenAI REST/{model}")
+                            return text
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+    return ""
+
+
+def _call_opensource_fallback(prompt: str, timeout: int = 120) -> str:
+    """Codex fallback 2순위: 오픈소스 API (무료)"""
+    try:
+        import requests as _req
+    except ImportError:
+        return ""
+    for name, base, env_key, model, extra_h in [
+        ("Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile", {}),
+        ("Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "llama-3.3-70b", {}),
+        ("OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "meta-llama/llama-3.3-70b-instruct:free",
+         {"HTTP-Referer": "https://github.com/horcrux", "X-Title": "Horcrux"}),
+    ]:
+        key = os.environ.get(env_key, "")
+        if not key:
+            continue
+        try:
+            h = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            h.update(extra_h)
+            r = _req.post(f"{base}/chat/completions", headers=h, json={
+                "model": model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8192, "temperature": 0.7}, timeout=timeout)
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            if text:
+                print(f"[FALLBACK] → {name}/{model}")
+                return text
+        except Exception as e:
+            print(f"[FALLBACK] {name} failed: {str(e)[:200]}")
+    return ""
+
+
+def _codex_fallback(prompt: str) -> str:
+    """Codex CLI 실패 시 전체 fallback: OpenAI SDK → 오픈소스"""
+    result = _call_openai_sdk(prompt)
+    if result:
+        return result
+    result = _call_opensource_fallback(prompt)
+    if result:
+        return result
+    return "[ERROR] Codex CLI failed. Set OPENAI_API_KEY (best) or GROQ_API_KEY (free) in .env"
+
+
 def call_codex(prompt: str, timeout: int = 600) -> str:
-    """Codex CLI - exec stdin 방식 (v7 원본 복원)"""
+    """Codex CLI → OpenAI SDK → Open Source API 자동 전환"""
     prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
         if platform.system() == "Windows":
@@ -319,12 +697,21 @@ def call_codex(prompt: str, timeout: int = 600) -> str:
             timeout=timeout, encoding="utf-8", errors="replace"
         )
         out = r.stdout.strip()
-        if r.returncode != 0 and not out:
-            return f"[ERROR] Codex (rc={r.returncode}): {r.stderr[:500]}"
-        return out if out else f"[ERROR] Codex empty: {r.stderr[:300]}"
+        if r.returncode == 0 and out and "[ERROR]" not in out:
+            return out
+        if r.returncode != 0 or not out:
+            fb = _codex_fallback(prompt)
+            if "[ERROR]" not in fb:
+                return fb
+        return out if out else f"[ERROR] Codex (rc={r.returncode}): {(r.stderr or '')[:500]}"
+    except FileNotFoundError:
+        return _codex_fallback(prompt)
     except subprocess.TimeoutExpired: return "[ERROR] Codex timeout"
-    except FileNotFoundError: return "[ERROR] Codex CLI not found"
-    except Exception as e: return f"[ERROR] Codex: {str(e)[:500]}"
+    except Exception as e:
+        fb = _codex_fallback(prompt)
+        if "[ERROR]" not in fb:
+            return fb
+        return f"[ERROR] Codex: {str(e)[:500]}"
 
 
 def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
@@ -393,73 +780,173 @@ def call_gemini(prompt: str, timeout: int = 300) -> str:
 debates = {}
 
 
+# ── Auxiliary Open Source API Critics ──
+
+# Aux 3모델: Meta Llama(Dense) + DeepSeek V3(MoE 671B) + GPT-OSS(MoE 117B)
+# 학습 데이터/아키텍처/편향이 전부 다르므로 비판 관점 극대화
+AUX_CRITIC_ENDPOINTS = [
+    ("Groq/Llama", "https://api.groq.com/openai/v1", "GROQ_API_KEY",
+     "llama-3.3-70b-versatile", {}),
+    ("DS/DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY",
+     "deepseek-chat", {}),
+    ("OR/GPT-OSS", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+     "openai/gpt-oss-120b:free",
+     {"HTTP-Referer": "https://github.com/horcrux", "X-Title": "Horcrux"}),
+]
+
+AUX_MAX_PROMPT_CHARS = 15000  # Aux는 핵심만 받음. Core는 60K 전체, Aux는 15K 압축
+
+def _truncate_for_aux(prompt: str) -> str:
+    """Aux critic용 프롬프트 압축. 앞뒤 보존, 중간 잘라내기."""
+    if len(prompt) <= AUX_MAX_PROMPT_CHARS:
+        return prompt
+    keep = AUX_MAX_PROMPT_CHARS // 2 - 50
+    cut = len(prompt) - AUX_MAX_PROMPT_CHARS
+    return prompt[:keep] + f"\n\n...[AUX TRUNCATED {cut} chars]...\n\n" + prompt[-keep:]
+
+def _call_aux_critic(name, base_url, env_key, model, extra_headers, prompt, timeout=180):
+    """Aux critic API. 프롬프트 15K 압축 + timeout=180s (3분, 분석 시간 충분히 배정). 서비스 장애(429/네트워크)만 처리."""
+    api_key = os.environ.get(env_key, "")
+    if not api_key:
+        return name, ""
+    try:
+        import requests as _req
+        short_prompt = _truncate_for_aux(prompt)
+        h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        h.update(extra_headers)
+        r = _req.post(f"{base_url}/chat/completions", headers=h, json={
+            "model": model,
+            "messages": [{"role": "user", "content": short_prompt}],
+            "max_tokens": 8192, "temperature": 0.7,
+        }, timeout=timeout)
+        if r.status_code == 429:
+            print(f"  [AUX] {name} rate limited (429), skipped")
+            return name, ""
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        print(f"  [AUX] {name}/{model} responded ({len(text)} chars)")
+        return name, text
+    except Exception as e:
+        print(f"  [AUX] {name} failed: {str(e)[:150]}")
+        return name, ""
+
+
 def run_multi_critic(task, solution, previously_fixed_text):
-    """Phase 2: Codex + Gemini 병렬 Critic"""
+    """Phase 2+: Codex + Gemini + Aux(Groq/Together/OpenRouter) 병렬 Critic"""
     prompt = CRITIC_PROMPT.format(
         task=task, solution=solution,
         previously_fixed=previously_fixed_text or "None (first round)"
     )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+
+    # 사용 가능한 Aux 엔드포인트 수집
+    available_aux = [
+        ep for ep in AUX_CRITIC_ENDPOINTS
+        if os.environ.get(ep[2])
+    ]
+    total_workers = 2 + len(available_aux)  # Codex + Gemini + Aux N개
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(total_workers, 2)) as pool:
+        # Core critics
         f_codex = pool.submit(call_codex, prompt)
         f_gemini = pool.submit(call_gemini, prompt)
+
+        # Aux critics (병렬)
+        aux_futures = []
+        for name, base, env_key, model, extra_h in available_aux:
+            f = pool.submit(_call_aux_critic, name, base, env_key, model, extra_h, prompt)
+            aux_futures.append(f)
+
         codex_raw = f_codex.result()
         gemini_raw = f_gemini.result()
+        aux_results = [f.result() for f in aux_futures]  # [(name, raw_text), ...]
 
     codex_data = extract_json(codex_raw) or {}
     gemini_data = extract_json(gemini_raw) or {}
 
-    codex_score = extract_score(codex_data, codex_raw)
-    gemini_score = extract_score(gemini_data, gemini_raw)
+    # v5.2+: normalize_critic_output으로 공통 schema 변환
+    codex_norm = normalize_critic_output(codex_data, "Codex")
+    gemini_norm = normalize_critic_output(gemini_data, "Gemini")
 
-    # 보수적 점수: 두 Critic 중 낮은 점수
-    min_score = min(codex_score, gemini_score)
+    codex_score = codex_norm["score"]
+    gemini_score = gemini_norm["score"]
 
-    # 차원별 최소값
+    # Aux 점수 수집 (normalized)
+    aux_scores = {}
+    aux_norms = []
+    for name, raw in aux_results:
+        if not raw:
+            continue
+        data = extract_json(raw) or {}
+        norm = normalize_critic_output(data, name)
+        aux_scores[name] = norm["score"]
+        aux_norms.append(norm)
+
+    # 점수 계산: Core min * 0.8 + Aux avg * 0.2 (aux 있을 때)
+    core_min = min(codex_score, gemini_score)
+    if aux_scores:
+        aux_avg = sum(aux_scores.values()) / len(aux_scores)
+        overall = core_min * 0.8 + aux_avg * 0.2
+    else:
+        overall = core_min
+
+    # 차원별 최소값 (core만, aux는 참고)
     merged_dims = {}
     for dim in ["correctness", "completeness", "security", "performance"]:
         vals = []
-        for d in [codex_data, gemini_data]:
-            v = d.get("scores", {}).get(dim)
+        for norm in [codex_norm, gemini_norm]:
+            v = norm.get("dimension_scores", {}).get(dim)
             if v is not None:
-                try: vals.append(float(v))
-                except: pass
+                vals.append(float(v))
         merged_dims[dim] = min(vals) if vals else 5.0
 
-    # 이슈 합산 + 중복 제거
+    # 이슈 합산 + 중복 제거 (Core + Aux, normalized issues 사용)
     all_issues = []
     seen = set()
-    for data, src in [(codex_data, "Codex"), (gemini_data, "Gemini")]:
-        for iss in data.get("issues", []):
-            if isinstance(iss, dict):
-                key = iss.get("desc", "")[:40]
-                if key not in seen:
-                    seen.add(key)
-                    iss_copy = dict(iss)
-                    iss_copy["source"] = src
-                    all_issues.append(iss_copy)
+    all_norms = [codex_norm, gemini_norm] + aux_norms
+    for norm in all_norms:
+        for iss in norm.get("issues", []):
+            key = iss.get("summary", iss.get("desc", ""))[:40]
+            if key and key not in seen:
+                seen.add(key)
+                all_issues.append(iss)
 
-    # regression 합산
-    regressions = list(set(
-        (codex_data.get("regressions") or []) +
-        (gemini_data.get("regressions") or [])
-    ))
-    regressions = [r for r in regressions if r and r != "<regressed issue if any>"]
+    # regression 합산 (normalized)
+    all_regressions = []
+    for norm in all_norms:
+        all_regressions.extend(norm.get("regressions", []))
+    # 문자열 regression 중복 제거
+    reg_seen = set()
+    regressions = []
+    for r in all_regressions:
+        key = r.get("summary", str(r))[:60] if isinstance(r, dict) else str(r)[:60]
+        if key and key not in reg_seen:
+            reg_seen.add(key)
+            regressions.append(r)
+
+    # critic_scores 합산
+    critic_scores = {"Codex": codex_score, "Gemini": gemini_score}
+    critic_scores.update(aux_scores)
 
     return {
-        "overall": min_score,
+        "overall": round(overall, 1),
         "scores": merged_dims,
         "issues": all_issues,
         "regressions": regressions,
-        "summary": codex_data.get("summary", "") or gemini_data.get("summary", ""),
-        "strengths": codex_data.get("strengths", []) + gemini_data.get("strengths", []),
-        "critic_scores": {"Codex": codex_score, "Gemini": gemini_score},
+        "summary": codex_norm.get("summary", "") or gemini_norm.get("summary", ""),
+        "strengths": codex_norm.get("strengths", []) + gemini_norm.get("strengths", []),
+        "critic_scores": critic_scores,
+        "aux_count": len(aux_scores),
+        "normalized_critics": {n["model"]: n for n in all_norms},  # v5.2+: 정규화된 critic 데이터 전체
     }
 
 
-def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
+def run_debate(debate_id, task, threshold, max_rounds, initial_solution="", claude_model=""):
     state = debates[debate_id]
     solution = initial_solution
     all_round_issues = []   # 라운드별 이슈 누적 (regression detection용)
+    last_generator_data = None  # v5.2: rejected_alternatives 전달용
+    last_critic_merged = None   # v5.2: compact context package용
+    last_diagnostics = None     # v5.2: revision focus용
 
     try:
         for r in range(1, max_rounds + 1):
@@ -477,7 +964,27 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
 
             if r == 1 and not initial_solution:
                 prompt = GENERATOR_PROMPT.format(task=task)
+            elif last_diagnostics and last_critic_merged:
+                # v5.2: blocker 중심 revise (compact context package 사용)
+                rev_focus = build_revision_focus(last_diagnostics, last_critic_merged)
+                ctx_pkg = build_compact_context_package(
+                    solution[:2000], last_critic_merged, last_diagnostics, last_generator_data
+                )
+                prompt = GENERATOR_IMPROVE_PROMPT_V2.format(
+                    task=task, solution=solution,
+                    blocking_issues=format_issues_compact(rev_focus.get("blocking_issues", [])),
+                    regressions="\n".join(str(r) for r in rev_focus.get("regressions", [])) or "None",
+                    worst_dimensions=", ".join(rev_focus.get("worst_dimensions", [])) or "None",
+                    critic_disagreements="\n".join(ctx_pkg.get("critic_disagreements", [])) or "None",
+                    alternative_views="\n".join(
+                        (a.get("alternative", str(a)) if isinstance(a, dict) else str(a))
+                        for a in ctx_pkg.get("alternative_views", [])
+                    ) or "None",
+                    preserve=", ".join(ctx_pkg.get("preserve", [])) or "None",
+                    previously_fixed=prev_text,
+                )
             else:
+                # fallback: v5.1 방식
                 issues_text = format_issues_compact(
                     all_round_issues[-1] if all_round_issues else []
                 )
@@ -486,7 +993,7 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
                     issues=issues_text, previously_fixed=prev_text
                 )
 
-            raw = call_claude(prompt)
+            raw = call_claude(prompt, model=claude_model)
             if state.get("abort"): break
 
             jd = extract_json(raw)
@@ -502,6 +1009,7 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
             state["messages"].append({"role": "generator", "content": disp, "ts": datetime.now().isoformat()})
             # raw_steps에 구조화 데이터 저장
             state.setdefault("raw_steps", []).append({"role": "generator", "data": jd or {}})
+            last_generator_data = jd  # v5.2: rejected_alternatives 보존
 
             # ── Phase 2: Multi-Critic (Codex + Gemini 병렬) ──
             state["phase"] = "critic"
@@ -515,7 +1023,9 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
             # 표시용 포맷
             scores_str = " | ".join(f"{k}:{v}" for k, v in critic_merged["scores"].items())
             critic_scores_str = " | ".join(f"{k}:{v:.1f}" for k, v in critic_merged["critic_scores"].items())
-            disp = f"{c_score:.1f}/10 (min of Codex+Gemini) [{critic_scores_str}]\n"
+            aux_n = critic_merged.get("aux_count", 0)
+            scoring_label = f"Core*0.8+Aux({aux_n})*0.2" if aux_n else "min of Codex+Gemini"
+            disp = f"{c_score:.1f}/10 ({scoring_label}) [{critic_scores_str}]\n"
             disp += f"Dims: [{scores_str}]\n"
             disp += f"{critic_merged.get('summary', '')}\n"
             if critic_merged["issues"]:
@@ -536,8 +1046,14 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution=""):
             state["messages"].append({"role": "critic", "content": disp, "score": c_score, "ts": datetime.now().isoformat()})
             state.setdefault("raw_steps", []).append({"role": "critic", "data": critic_merged})
 
+            # v5.2: diagnostics 저장 (다음 라운드 revision focus용)
+            last_critic_merged = critic_merged
+            last_diagnostics = check_convergence_v2(critic_merged, threshold)
+            state.setdefault("raw_steps", []).append({"role": "diagnostics", "data": last_diagnostics})
+
             # ── 수렴 판정 (다차원) ──
-            converged, reason = check_convergence(critic_merged, threshold)
+            converged = last_diagnostics["converged"]
+            reason = last_diagnostics.get("reason", "converged")
             if converged:
                 state["status"] = "converged"
                 state["final_solution"] = solution
@@ -691,26 +1207,62 @@ def run_pair(pair_id, task, mode, extra_context="", artifact=None):
                 extra_context=ctx,
             ))
 
+        PAIR_TIMEOUT = 1200  # 20min per part (code gen is heavy)
+        PAIR_RETRY_CALLERS = [
+            ("Claude", call_claude),
+            ("Codex", call_codex),
+            ("Gemini", call_gemini),
+        ]
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_parts) as pool:
             futures = []
             for i, prompt in enumerate(prompts):
                 if state.get("abort"):
                     break
                 ai_name, ai_fn = AI_CALLERS[i % len(AI_CALLERS)]
-                futures.append((parts[i], ai_name, pool.submit(ai_fn, prompt)))
+                futures.append((parts[i], ai_name, ai_fn, prompt, pool.submit(ai_fn, prompt)))
 
-            for part, ai_name, future in futures:
+            for part, ai_name, ai_fn, prompt, future in futures:
                 if state.get("abort"):
                     break
-                raw = future.result()
-                pj = extract_json(raw)
                 part_id = part.get("id", part.get("title", "unknown"))
+                raw = None
+                used_model = ai_name
+
+                # 1차 시도 (timeout 포함)
+                try:
+                    raw = future.result(timeout=PAIR_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    print(f"[PAIR] {ai_name} timed out for {part_id}, retrying...")
+                    raw = None
+                except Exception as e:
+                    print(f"[PAIR] {ai_name} error for {part_id}: {e}")
+                    raw = None
+
+                # 타임아웃/실패 시 다른 모델로 재시도
+                if not raw or "[ERROR]" in (raw or ""):
+                    for retry_name, retry_fn in PAIR_RETRY_CALLERS:
+                        if retry_name == ai_name:
+                            continue  # 같은 모델 스킵
+                        print(f"[PAIR] Retrying {part_id} with {retry_name}...")
+                        try:
+                            raw = retry_fn(prompt, timeout=PAIR_TIMEOUT)
+                            if raw and "[ERROR]" not in raw:
+                                used_model = f"{retry_name} (retry)"
+                                break
+                        except Exception:
+                            continue
+
+                # 결과 저장 (실패해도 부분 결과 보존)
+                pj = extract_json(raw) if raw else None
+                status_label = "ok" if pj else "raw" if raw else "failed"
                 state["messages"].append({
-                    "role": part_id, "model": ai_name,
+                    "role": part_id, "model": used_model,
                     "title": part.get("title", ""),
-                    "content": json.dumps(pj, indent=2) if pj else raw
+                    "status": status_label,
+                    "content": json.dumps(pj, indent=2) if pj else (raw or f"[FAILED] {ai_name} and all retries failed for {part_id}")
                 })
-                state["results"][part_id] = pj or {"raw": raw}
+                state["results"][part_id] = pj or {"raw": raw or "", "status": status_label}
 
         if state.get("abort"):
             state["status"] = "aborted"; return
@@ -851,6 +1403,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+
 @app.route("/api/start", methods=["POST"])
 def start_debate():
     data = request.json
@@ -898,11 +1451,14 @@ def start_debate():
         "project_dir": project_dir,
         "created_at": datetime.now().isoformat(), "finished_at": None,
     }
+    claude_model = CLAUDE_MODELS.get(data.get("claude_model", ""), "")
+    debates[debate_id]["claude_model"] = claude_model
+
     t = threading.Thread(target=run_debate,
-                         args=(debate_id, task, threshold, max_rounds, initial_solution),
+                         args=(debate_id, task, threshold, max_rounds, initial_solution, claude_model),
                          daemon=True)
     t.start()
-    return jsonify({"debate_id": debate_id, "project_dir": project_dir})
+    return jsonify({"debate_id": debate_id, "project_dir": project_dir, "claude_model": claude_model or "default"})
 
 
 @app.route("/api/status/<debate_id>")
@@ -968,7 +1524,8 @@ def list_threads():
                 "created_at": d.get("created_at", ""),
             }
         except: pass
-    for tid, d in {**debates, **pairs, **pipelines, **self_improves}.items():
+    from planning_v2 import plannings as plan_v2_states
+    for tid, d in {**debates, **pairs, **pipelines, **self_improves, **plan_v2_states, **horcrux_states}.items():
         threads[tid] = {
             "id": tid, "task": d.get("task", "")[:80],
             "status": d.get("status", "unknown"),
@@ -1032,10 +1589,12 @@ def get_timing(job_id):
 
 @app.route("/api/delete/<debate_id>", methods=["DELETE"])
 def delete_thread(debate_id):
+    from planning_v2 import plannings as plan_v2_states
     debates.pop(debate_id, None)
     pairs.pop(debate_id, None)
     pipelines.pop(debate_id, None)
     self_improves.pop(debate_id, None)
+    plan_v2_states.pop(debate_id, None)
     log_file = LOG_DIR / f"{debate_id}.json"
     if log_file.exists(): log_file.unlink()
     return jsonify({"ok": True})
@@ -1322,7 +1881,7 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Debate Chain v7</title>
+<title>Horcrux v7</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+KR:wght@400;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1369,7 +1928,7 @@ textarea:focus{outline:none;border-color:#00e5ff;box-shadow:0 0 0 2px #00e5ff33}
 .role-synthesizer{background:#da77f218;border:1px solid #da77f244;color:#da77f2}
 .score{display:inline-flex;border-radius:5px;padding:2px 8px;font-size:12px;font-weight:800;font-family:'JetBrains Mono',monospace}
 .score-pass{background:#69db7c22;border:1px solid #69db7c55;color:#69db7c}.score-fail{background:#ff6b6b22;border:1px solid #ff6b6b55;color:#ff6b6b}
-.msg pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.6;color:#d4d4d4;font-family:'JetBrains Mono',monospace;background:#1a1a2e;border-radius:8px;padding:14px;max-height:400px;overflow:auto;border:1px solid #2a2a4a}
+.msg pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.6;color:#d4d4d4;font-family:'JetBrains Mono',monospace;background:#1a1a2e;border-radius:8px;padding:14px;max-height:800px;overflow:auto;border:1px solid #2a2a4a}
 .round-divider{display:flex;align-items:center;gap:12px;margin:20px 0 16px;color:#555;font-size:11px;font-family:'JetBrains Mono',monospace}
 .round-divider::before,.round-divider::after{content:'';flex:1;height:1px;background:#1a1a3a}
 .result{margin-top:16px;padding:16px;border-radius:10px;animation:fadeSlide .4s ease}
@@ -1384,22 +1943,22 @@ textarea:focus{outline:none;border-color:#00e5ff;box-shadow:0 0 0 2px #00e5ff33}
 <body>
 <div class="app">
 <div class="sidebar">
-  <div class="sidebar-header"><h2>Debate Chain v7</h2><button class="btn-new" onclick="newThread()">+ New</button></div>
+  <div class="sidebar-header"><h2>Horcrux v7</h2><button class="btn-new" onclick="newThread()">+ New</button></div>
   <div class="thread-list" id="threadList"></div>
 </div>
 <div class="main">
   <div class="header">
-    <div><h1>Debate Chain v7</h1><p>Multi-Critic · Regression · Pipeline</p></div>
-    <div class="roles">
+    <div><h1>Horcrux v7</h1><p>Multi-Critic · Regression · Pipeline</p></div>
+    <div class="roles" id="rolesInfo">
       <span style="color:#00e5ff">Claude (Gen)</span>
-      <span style="color:#ff6b6b">Codex+Gemini (Critics)</span>
+      <span style="color:#ff6b6b">Codex+Gemini+Aux (Critics)</span>
       <span style="color:#da77f2">Codex (Synth)</span>
     </div>
   </div>
   <div class="content" id="content">
     <div class="empty" id="emptyState">
-      <div class="empty-text">New debate</div>
-      <div class="empty-sub">Multi-Critic(Codex+Gemini) · Regression detection · Multidimensional convergence<br>Synthesizer=Codex (different model from Generator)</div>
+      <div class="empty-text" id="emptyTitle">New debate</div>
+      <div class="empty-sub" id="emptySub">Multi-Critic(Codex+Gemini) · Regression detection · Multidimensional convergence<br>Synthesizer=Codex (different model from Generator)</div>
       <button class="test-btn" onclick="testConnections()">Test connections</button>
       <div id="testResult" style="margin-top:12px;font-size:12px;font-family:'JetBrains Mono',monospace;max-width:500px"></div>
     </div>
@@ -1411,25 +1970,82 @@ textarea:focus{outline:none;border-color:#00e5ff;box-shadow:0 0 0 2px #00e5ff33}
     <div id="resultArea"></div>
   </div>
   <div class="input-area">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+      <div style="display:flex;gap:4px;margin-right:8px">
+        <button id="modeAuto" class="btn" onclick="setMode('auto')" style="padding:4px 12px;font-size:11px;background:linear-gradient(135deg,#bc8cff,#58a6ff);color:#000">Auto</button>
+        <button id="modeFast" class="btn" onclick="setMode('fast')" style="padding:4px 12px;font-size:11px;background:#2a2a4a;color:#888;border:1px solid #3a3a5a">Fast</button>
+        <button id="modeStandard" class="btn" onclick="setMode('standard')" style="padding:4px 12px;font-size:11px;background:#2a2a4a;color:#888;border:1px solid #3a3a5a">Standard</button>
+        <button id="modeFull" class="btn" onclick="setMode('full')" style="padding:4px 12px;font-size:11px;background:#2a2a4a;color:#888;border:1px solid #3a3a5a">Full</button>
+        <button id="modeParallel" class="btn" onclick="setMode('parallel')" style="padding:4px 12px;font-size:11px;background:#2a2a4a;color:#888;border:1px solid #3a3a5a">Parallel</button>
+      </div>
+      <label style="font-size:11px;color:#888;font-weight:600">Claude</label>
+      <select id="modelSelect" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:12px;padding:4px 8px;font-family:'JetBrains Mono',monospace;cursor:pointer">
+        <option value="">Auto (default)</option>
+        <option value="opus">Opus 4.6</option>
+        <option value="sonnet">Sonnet 4.6</option>
+      </select>
+      <div id="autoOpts" style="display:flex;gap:8px;align-items:center;margin-left:4px">
+        <select id="autoScope" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Scope">
+          <option value="auto">Scope: Auto</option>
+          <option value="small">Small</option>
+          <option value="medium">Medium</option>
+          <option value="large">Large</option>
+        </select>
+        <select id="autoRisk" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Risk">
+          <option value="auto">Risk: Auto</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+        </select>
+        <select id="autoArtifact" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Artifact">
+          <option value="none">No Artifact</option>
+          <option value="ppt">PPT</option>
+          <option value="pdf">PDF</option>
+          <option value="doc">Doc</option>
+        </select>
+      </div>
+      <div id="parallelOpts" style="display:none;gap:8px;align-items:center;margin-left:4px">
+        <select id="parallelParts" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Parts">
+          <option value="2">2 AI</option>
+          <option value="3">3 AI</option>
+        </select>
+        <input id="outputDir" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px;width:140px" placeholder="Output Dir (optional)">
+      </div>
+      <div id="fullOpts" style="display:none;gap:8px;align-items:center;margin-left:4px">
+        <select id="fullArtifact" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Artifact">
+          <option value="none">No Artifact</option>
+          <option value="ppt">PPT</option>
+          <option value="pdf">PDF</option>
+          <option value="doc">Doc</option>
+        </select>
+        <input id="fullAudience" value="general" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px;width:70px" placeholder="Audience">
+        <select id="fullTone" style="background:#12122a;border:1px solid #2a2a4a;border-radius:6px;color:#e0e0e0;font-size:11px;padding:4px 6px" title="Tone">
+          <option value="professional">Pro</option>
+          <option value="casual">Casual</option>
+          <option value="technical">Tech</option>
+        </select>
+      </div>
+    </div>
     <div class="input-row">
       <textarea id="taskInput" rows="1" placeholder="Enter task... (Enter to run, Shift+Enter for newline)" oninput="autoGrow(this)"></textarea>
-      <button id="btnStop" class="btn btn-stop" style="display:none" onclick="stopDebate()">Stop</button>
-      <button id="btnRun" class="btn btn-run" onclick="startDebate()">Run</button>
+      <button id="btnStop" class="btn btn-stop" style="display:none" onclick="stopRun()">Stop</button>
+      <button id="btnRun" class="btn btn-run" onclick="startRun()">Run</button>
     </div>
   </div>
 </div>
 </div>
 <script>
-const ROLES={generator:{name:"Generator(Claude)",cls:"generator"},critic:{name:"Critic(Codex+Gemini)",cls:"critic"},synthesizer:{name:"Synthesizer(Codex)",cls:"synthesizer"}};
+const ROLES={generator:{name:"Generator(Claude)",cls:"generator"},critic:{name:"Critic(Codex+Gemini+Aux)",cls:"critic"},synthesizer:{name:"Synthesizer(Codex)",cls:"synthesizer"},final:{name:"Final Polish(Codex)",cls:"synthesizer"}};
 const THRESHOLD=8.0,MAX_ROUNDS=5;
-let cid=null,pt=null,lmc=0,run=false;
+let cid=null,pt=null,lmc=0,run=false,curMode='auto';
 function autoGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px'}
-document.getElementById("taskInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();startDebate()}});
+document.getElementById("taskInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();startRun()}});
 async function testConnections(){const el=$('testResult');el.innerHTML='Testing...';try{const r=await fetch("/api/test");const d=await r.json();el.innerHTML=Object.entries(d).map(([k,v])=>{const c=v.ok?'#69db7c':'#ff6b6b';return `<div style="color:${c};margin:6px 0;padding:8px;background:${c}11;border:1px solid ${c}33;border-radius:6px"><b>${v.ok?'OK':'FAIL'} ${k} ${v.json?'JSON ok':'no JSON'}</b></div>`}).join('')}catch(e){el.innerHTML=`<span style="color:#ff6b6b">${e.message}</span>`}}
-async function loadThreads(){const r=await fetch("/api/threads");const t=await r.json();const el=$('threadList');if(!t.length){el.innerHTML='<div style="padding:20px;text-align:center;color:#444;font-size:12px">No debates yet</div>';return}el.innerHTML=t.map(t=>{const a=t.id===cid?'active':'';const sc=t.avg_score>=THRESHOLD?'#69db7c':t.avg_score>0?'#ff6b6b':'#666';const tm=t.created_at?new Date(t.created_at).toLocaleString('ko-KR',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';return `<div class="thread-item ${a}" onclick="selectThread('${t.id}')"><div class="thread-task">${esc(t.task)}</div><div class="thread-meta"><span class="thread-status ${t.status}"></span><span>${t.status}</span><span>R${t.round}</span><span class="thread-score" style="color:${sc}">${t.avg_score>0?t.avg_score.toFixed(1):'-'}</span><span style="margin-left:auto;color:#555">${tm}</span><span class="thread-delete" onclick="event.stopPropagation();deleteThread('${t.id}')">x</span></div></div>`}).join('')}
-function statusUrl(id){if(id.startsWith('pair_'))return`/api/pair/status/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/status/${id}`;if(id.startsWith('si_'))return`/api/self_improve/status/${id}`;return`/api/status/${id}`}
-function resultUrl(id){if(id.startsWith('pair_'))return`/api/pair/result/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/result/${id}`;if(id.startsWith('si_'))return`/api/self_improve/result/${id}`;return`/api/result/${id}`}
+async function loadThreads(){const r=await fetch("/api/threads");const t=await r.json();const el=$('threadList');if(!t.length){el.innerHTML='<div style="padding:20px;text-align:center;color:#444;font-size:12px">No tasks yet</div>';return}el.innerHTML=t.map(t=>{const a=t.id===cid?'active':'';const sc=t.avg_score>=THRESHOLD?'#69db7c':t.avg_score>0?'#ff6b6b':'#666';const tm=t.created_at?new Date(t.created_at).toLocaleString('ko-KR',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';return `<div class="thread-item ${a}" onclick="selectThread('${t.id}')"><div class="thread-task">${esc(t.task)}</div><div class="thread-meta"><span class="thread-status ${t.status}"></span><span>${t.status}</span><span>R${t.round}</span><span class="thread-score" style="color:${sc}">${t.avg_score>0?t.avg_score.toFixed(1):'-'}</span><span style="margin-left:auto;color:#555">${tm}</span><span class="thread-delete" onclick="event.stopPropagation();deleteThread('${t.id}')">x</span></div></div>`}).join('')}
+function statusUrl(id){if(id.startsWith('plan_'))return`/api/planning/status/${id}`;if(id.startsWith('pair_'))return`/api/pair/status/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/status/${id}`;if(id.startsWith('si_'))return`/api/self_improve/status/${id}`;if(id.startsWith('hrx_'))return`/api/horcrux/status/${id}`;if(id.startsWith('adp_'))return`/api/horcrux/status/${id}`;return`/api/status/${id}`}
+function resultUrl(id){if(id.startsWith('plan_'))return`/api/planning/result/${id}`;if(id.startsWith('pair_'))return`/api/pair/result/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/result/${id}`;if(id.startsWith('si_'))return`/api/self_improve/result/${id}`;if(id.startsWith('hrx_'))return`/api/horcrux/result/${id}`;if(id.startsWith('adp_'))return`/api/horcrux/result/${id}`;return`/api/result/${id}`}
 async function selectThread(id){if(pt)clearInterval(pt);cid=id;lmc=0;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';
+  const isP=id.startsWith('plan_');const isPair=id.startsWith('pair_');const isHrx=id.startsWith('hrx_')||id.startsWith('adp_');setMode(isP||isHrx?'auto':isPair?'parallel':'auto');
   const sr=await fetch(statusUrl(id));const s=await sr.json();
   if(s.error==='not found')return;
   if(s.status==='running'){
@@ -1443,16 +2059,25 @@ async function selectThread(id){if(pt)clearInterval(pt);cid=id;lmc=0;$('messages
     run=false;$('btnRun').disabled=false;$('btnStop').style.display='none';$('progressArea').style.display='none';renderResult(full);
   }
   loadThreads();}
-function renderAll(s){const c=$('messages');c.innerHTML='';let cr=0;(s.messages||[]).forEach(m=>{if(m.role==='generator'){cr++;c.innerHTML+=`<div class="round-divider">Round ${cr}</div>`}const r=ROLES[m.role]||{name:m.role,cls:"generator"};let sh='';if(m.score!==undefined){const p=m.score>=THRESHOLD;sh=`<span class="score ${p?'score-pass':'score-fail'}">${m.score.toFixed(1)}/10</span>`}c.innerHTML+=`<div class="msg msg-${r.cls}"><div class="msg-header"><span class="role-tag role-${r.cls}">${r.name}</span>${sh}</div><pre>${esc(m.content)}</pre></div>`});lmc=(s.messages||[]).length;sb()}
-function renderResult(s){if(s.status!=='converged'&&s.status!=='max_rounds'&&s.status!=='completed')return;const ok=s.status==='converged'||s.status==='completed';const deepBtn=s.final_solution?`<button class="btn-copy" style="background:#da77f222;border-color:#da77f255;color:#da77f2" onclick="deepDive('${s.id}')">🔍 Deep Dive</button>`:'';$('resultArea').innerHTML=`<div class="result ${ok?'result-ok':'result-fail'}"><div class="result-header"><span class="result-icon">${ok?'✅':'⚠️'}</span><div><div class="result-title" style="color:${ok?'#69db7c':'#ff6b6b'}">${s.status}</div><div class="result-sub">${s.round||0} rounds · Score: ${(s.avg_score||0).toFixed(1)}/10${s.parent_debate_id?` · (child of ${s.parent_debate_id})`:''}</div></div>${deepBtn}<button class="btn-copy" onclick="copyResult()">Copy</button></div></div>`}
+function renderAll(s){const c=$('messages');c.innerHTML='';let cr=0;const isPlanning=!!s.final_plan||(s.id||'').startsWith('plan_');const isPair=(s.id||'').startsWith('pair_');(s.messages||[]).forEach(m=>{if(isPair){const pairRoles={architect:{name:'Architect (Claude)',cls:'synthesizer'},part1:{name:'Part 1',cls:'generator'},part2:{name:'Part 2',cls:'critic'},part3:{name:'Part 3',cls:'synthesizer'}};const pr=pairRoles[m.role]||{name:m.role,cls:'generator'};const label=m.label||pr.name;const statusTag=m.status?` <span style="font-size:10px;color:${m.status==='ok'?'#69db7c':'#ffd43b'}">[${m.status}]</span>`:'';const modelTag=m.model?` <span style="font-size:10px;color:#555">(${m.model})</span>`:'';if(m.role==='architect'){c.innerHTML+=`<div class="round-divider">Task Splitting</div>`}else if(m.role==='part1'){c.innerHTML+=`<div class="round-divider">Parallel Generation</div>`}c.innerHTML+=`<div class="msg msg-${pr.cls}"><div class="msg-header"><span class="role-tag role-${pr.cls}">${label}</span>${modelTag}${statusTag}</div><pre>${esc(m.content)}</pre></div>`;return}if(!isPlanning&&m.role==='generator'){cr++;c.innerHTML+=`<div class="round-divider">Round ${cr}</div>`}if(isPlanning){const phaseMap={generator:'Phase 1: Generate',synthesizer:'Phase 2: Synthesize',critic:'Phase 3: Critique',final:'Phase 4: Final Polish'};const ph=phaseMap[m.role];if(ph&&!c.innerHTML.includes(ph)){c.innerHTML+=`<div class="round-divider">${ph}</div>`}}const label=m.label||((ROLES[m.role]||{}).name)||m.role;const cls=(ROLES[m.role]||{cls:'generator'}).cls;let sh='';if(m.score!==undefined){const p=m.score>=THRESHOLD;sh=`<span class="score ${p?'score-pass':'score-fail'}">${Number(m.score).toFixed(1)}/10</span>`}const modelTag=m.model?` <span style="font-size:10px;color:#555">(${m.model})</span>`:'';c.innerHTML+=`<div class="msg msg-${cls}"><div class="msg-header"><span class="role-tag role-${cls}">${label}</span>${modelTag}${sh}</div><pre>${esc(m.content)}</pre></div>`});lmc=(s.messages||[]).length;sb()}
+function renderResult(s){if(s.status!=='converged'&&s.status!=='max_rounds'&&s.status!=='completed')return;const ok=s.status==='converged'||s.status==='completed';const isP=(s.id||'').startsWith('plan_');const isPair=(s.id||'').startsWith('pair_');const isDebate=!isP&&!isPair&&!(s.id||'').startsWith('hrx_')&&!(s.id||'').startsWith('si_');const deepBtn=(isDebate&&s.final_solution)?`<button class="btn-copy" style="background:#da77f222;border-color:#da77f255;color:#da77f2" onclick="deepDive('${s.id}')">Deep Dive</button>`:'';let sub;if(isPair){const partCount=Object.keys(s.results||{}).length;sub=`${s.mode||'pair2'} · ${partCount} parts generated · Parallel speed`}else if(isP){sub=`4 phases · Avg critic: ${(s.avg_score||0).toFixed(1)}/10`}else{sub=`${s.round||0} rounds · Score: ${(s.avg_score||0).toFixed(1)}/10${s.parent_debate_id?` · (child of ${s.parent_debate_id})`:''}`}$('resultArea').innerHTML=`<div class="result ${ok?'result-ok':'result-fail'}"><div class="result-header"><span class="result-icon">${ok?'✅':'⚠️'}</span><div><div class="result-title" style="color:${ok?'#69db7c':'#ff6b6b'}">${isPair?(s.mode||'Pair')+' '+s.status:isP?'Planning '+s.status:s.status}</div><div class="result-sub">${sub}</div></div>${deepBtn}<button class="btn-copy" onclick="copyResult()">Copy</button></div></div>`}
 async function deleteThread(id){await fetch(`/api/delete/${id}`,{method:'DELETE'});if(cid===id){cid=null;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='flex';$('taskInput').value='';$('progressArea').style.display='none'}loadThreads()}
 function newThread(){if(pt)clearInterval(pt);cid=null;lmc=0;run=false;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='flex';$('taskInput').value='';$('taskInput').focus();$('progressArea').style.display='none';$('btnRun').disabled=false;$('btnStop').style.display='none';loadThreads()}
-async function startDebate(){const task=$('taskInput').value.trim();if(!task||run)return;run=true;$('btnRun').disabled=true;$('btnStop').style.display='inline-block';$('progressArea').style.display='block';$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';lmc=0;const r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task,threshold:THRESHOLD,max_rounds:MAX_ROUNDS})});const d=await r.json();cid=d.debate_id;loadThreads();pt=setInterval(poll,1500)}
+function setMode(m){curMode=m;const modes=['auto','fast','standard','full','parallel'];const btnMap={auto:'modeAuto',fast:'modeFast',standard:'modeStandard',full:'modeFull',parallel:'modeParallel'};const gradients={auto:'linear-gradient(135deg,#bc8cff,#58a6ff)',fast:'linear-gradient(135deg,#3fb950,#2ea043)',standard:'linear-gradient(135deg,#d29922,#e3b341)',full:'linear-gradient(135deg,#f85149,#da3633)',parallel:'linear-gradient(135deg,#58a6ff,#388bfd)'};modes.forEach(md=>{const btn=$(btnMap[md]);if(btn){btn.style.background=md===m?gradients[md]:'#2a2a4a';btn.style.color=md===m?'#000':'#888';btn.style.border=md===m?'none':'1px solid #3a3a5a'}});const titles={auto:'New task',fast:'Fast mode',standard:'Standard mode',full:'Full mode',parallel:'Parallel mode'};const subs={auto:'task를 분석해서 최적 경로 자동 선택<br>코드 수정, 브레인스토밍, 문서 작성, PPT 생성, 아키텍처 설계 등 모든 작업',fast:'간단한 수정, 저위험 작업<br>빠른 1-pass 처리',standard:'중간 복잡도, pair gen + critic<br>일반적인 개발 작업에 최적',full:'고난도 작업, 풀체인 + aux critic<br>아키텍처 설계, 보안 감사, PPT/PDF 생성',parallel:'비판 없이 2~3 AI 병렬 생성<br>속도 최적화, 파트별 분할 작업'};const roles={auto:'<span style="color:#bc8cff">Classifier</span><span style="color:#58a6ff">Auto Router</span><span style="color:#69db7c">Best Engine</span>',fast:'<span style="color:#3fb950">Claude (1-pass)</span><span style="color:#69db7c">Fast Response</span>',standard:'<span style="color:#d29922">Claude (Gen)</span><span style="color:#ff6b6b">Critics</span><span style="color:#da77f2">Synth</span>',full:'<span style="color:#f85149">Multi-AI (Gen)</span><span style="color:#ff6b6b">Codex+Gemini+Aux (Critics)</span><span style="color:#da77f2">Opus (Synth)</span>',parallel:'<span style="color:#58a6ff">Claude</span><span style="color:#388bfd">Codex</span><span style="color:#69db7c">Gemini (opt)</span>'};$('emptyTitle').textContent=titles[m]||'New task';$('emptySub').innerHTML=subs[m]||'';$('btnRun').textContent='Run';$('autoOpts').style.display=m==='auto'?'flex':'none';$('parallelOpts').style.display=m==='parallel'?'flex':'none';$('fullOpts').style.display=m==='full'?'flex':'none';$('rolesInfo').innerHTML=roles[m]||''}
+async function startRun(){const task=$('taskInput').value.trim();if(!task||run)return;run=true;$('btnRun').disabled=true;$('btnStop').style.display='inline-block';$('progressArea').style.display='block';$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';lmc=0;
+  const body={task,mode:curMode,claude_model:$('modelSelect').value};
+  if(curMode==='auto'){const sc=$('autoScope').value;const ri=$('autoRisk').value;const ar=$('autoArtifact').value;if(sc!=='auto')body.scope=sc;if(ri!=='auto')body.risk=ri;if(ar!=='none')body.artifact_type=ar}
+  if(curMode==='parallel'){body.pair_mode='pair'+$('parallelParts').value;const od=$('outputDir').value.trim();if(od)body.output_dir=od}
+  if(curMode==='full'){const ar=$('fullArtifact').value;if(ar!=='none')body.artifact_type=ar;body.audience=$('fullAudience').value;body.tone=$('fullTone').value}
+  const r=await fetch('/api/horcrux/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();
+  if(d.solution){run=false;$('btnRun').disabled=false;$('btnStop').style.display='none';$('progressArea').style.display='none';$('messages').innerHTML=`<div class="msg msg-generator"><div class="msg-header"><span class="role-tag role-generator">Solution</span><span style="font-size:10px;color:#555">(${d.mode} / ${d.internal_engine})</span></div><pre>${esc(d.solution)}</pre></div>`;$('resultArea').innerHTML=`<div class="result result-ok"><div class="result-header"><span class="result-icon">✅</span><div><div class="result-title" style="color:#69db7c">${d.status}</div><div class="result-sub">${d.mode} · ${d.internal_engine} · score: ${d.score||0}/10</div></div><button class="btn-copy" onclick="navigator.clipboard.writeText(document.querySelector('.msg pre').textContent)">Copy</button></div></div>`;loadThreads();return}
+  cid=d.job_id;loadThreads();pt=setInterval(poll,2000)}
 async function poll(){if(!cid)return;
   const r=await fetch(statusUrl(cid));const s=await r.json();
-  $('progressLabel').textContent=`Round ${s.round||0}/${MAX_ROUNDS} - ${s.phase||'...'}`;
+  const isP=(cid||'').startsWith('plan_');const isPair=(cid||'').startsWith('pair_');
+  if(isPair){const numParts=s.mode==='pair3'?3:2;const done=s.parts_done||0;$('progressLabel').textContent=`${s.phase||'parallel_gen'} — ${done}/${numParts} parts done`;$('progressFill').style.width=Math.min((done/numParts)*100,100)+'%';$('progressScore').textContent=s.mode==='pair3'?'3-AI Parallel':'2-AI Parallel';$('progressScore').style.color='#69db7c'}else if(isP){const phaseIdx={starting:0,generating:1,synthesizing:2,critiquing:3,polishing:4,completed:4};const pi=phaseIdx[s.phase]||0;$('progressLabel').textContent=`Phase ${pi}/4 — ${s.phase_detail||s.phase||'...'}`;$('progressFill').style.width=Math.min((pi/4)*100,100)+'%';if(s.avg_score>0){$('progressScore').textContent=`Avg Critic: ${s.avg_score.toFixed(1)}/10`;$('progressScore').style.color=s.avg_score>=THRESHOLD?'#69db7c':'#ff6b6b'}}else{$('progressLabel').textContent=`Round ${s.round||0}/${MAX_ROUNDS} - ${s.phase||'...'}`;
   $('progressFill').style.width=Math.min(((s.round||0)/MAX_ROUNDS)*100,100)+"%";
-  if(s.avg_score>0){$('progressScore').textContent=`Score: ${s.avg_score.toFixed(1)} / ${THRESHOLD}`;$('progressScore').style.color=s.avg_score>=THRESHOLD?'#69db7c':'#ff6b6b'}
+  if(s.avg_score>0){$('progressScore').textContent=`Score: ${s.avg_score.toFixed(1)} / ${THRESHOLD}`;$('progressScore').style.color=s.avg_score>=THRESHOLD?'#69db7c':'#ff6b6b'}}
   if(s.status!=='running'){
     clearInterval(pt);run=false;$('btnRun').disabled=false;$('btnStop').style.display='none';$('progressArea').style.display='none';
     const fr=await fetch(resultUrl(cid));const full=await fr.json();
@@ -1460,25 +2085,351 @@ async function poll(){if(!cid)return;
   } else if(s.message_count>lmc){
     const fr=await fetch(resultUrl(cid));const full=await fr.json();
     const c=$('messages');const msgs=full.messages||[];
-    for(let i=lmc;i<msgs.length;i++){const m=msgs[i];if(m.role==='generator'){c.innerHTML+=`<div class="round-divider">Round ${Math.floor(i/3)+1}</div>`}const ro=ROLES[m.role]||{name:m.role,cls:"generator"};let sh='';if(m.score!==undefined){const p=m.score>=THRESHOLD;sh=`<span class="score ${p?'score-pass':'score-fail'}">${m.score.toFixed(1)}/10</span>`}c.innerHTML+=`<div class="msg msg-${ro.cls}"><div class="msg-header"><span class="role-tag role-${ro.cls}">${ro.name}</span>${sh}</div><pre>${esc(m.content)}</pre></div>`}
+    const isP2=(cid||'').startsWith('plan_');for(let i=lmc;i<msgs.length;i++){const m=msgs[i];if(!isP2&&m.role==='generator'){c.innerHTML+=`<div class="round-divider">Round ${Math.floor(i/3)+1}</div>`}if(isP2){const phaseMap={generator:'Phase 1: Generate',synthesizer:'Phase 2: Synthesize',critic:'Phase 3: Critique',final:'Phase 4: Final Polish'};const ph=phaseMap[m.role];if(ph&&!c.innerHTML.includes(ph)){c.innerHTML+=`<div class="round-divider">${ph}</div>`}}const ro=ROLES[m.role]||{name:m.role,cls:'generator'};const label=m.label||ro.name||m.role;const cls=ro.cls;let sh='';if(m.score!==undefined){const p=m.score>=THRESHOLD;sh=`<span class="score ${p?'score-pass':'score-fail'}">${Number(m.score).toFixed(1)}/10</span>`}const modelTag=m.model?` <span style="font-size:10px;color:#555">(${m.model})</span>`:'';c.innerHTML+=`<div class="msg msg-${cls}"><div class="msg-header"><span class="role-tag role-${cls}">${label}</span>${modelTag}${sh}</div><pre>${esc(m.content)}</pre></div>`}
     lmc=msgs.length;sb();
   }}
-async function stopDebate(){if(cid)await fetch(`/api/stop/${cid}`,{method:"POST"})}
+async function stopRun(){if(!cid)return;const isP=(cid||'').startsWith('plan_');const isPair=(cid||'').startsWith('pair_');const isSi=(cid||'').startsWith('si_');const isHrx=(cid||'').startsWith('hrx_')||(cid||'').startsWith('adp_');if(isP){await fetch(`/api/planning/stop/${cid}`,{method:'POST'})}else if(isPair){await fetch(`/api/pair/stop/${cid}`,{method:'POST'})}else if(isHrx){await fetch(`/api/horcrux/stop/${cid}`,{method:'POST'})}else{await fetch(`/api/stop/${cid}`,{method:'POST'})}}
 async function deepDive(parentId){const parentFull=await(await fetch(`/api/result/${parentId}`)).json();const task=parentFull.task||'';const focusHint=prompt(`Deep Dive 포커스 힌트 (선택사항, Enter 스킵):\n현재 task: ${task.slice(0,80)}`)??'';const finalTask=focusHint.trim()?`${task}\n\n[Deep Dive 포커스]: ${focusHint}`:task;if(!finalTask)return;if(pt)clearInterval(pt);run=true;$('btnRun').disabled=true;$('btnStop').style.display='inline-block';$('progressArea').style.display='block';$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';lmc=0;$('taskInput').value=finalTask;const r=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task:finalTask,threshold:THRESHOLD,max_rounds:MAX_ROUNDS,parent_debate_id:parentId})});const d=await r.json();cid=d.debate_id;loadThreads();pt=setInterval(poll,1500)}
-function copyResult(){fetch(`/api/result/${cid}`).then(r=>r.json()).then(s=>{navigator.clipboard.writeText(s.final_solution||'');const b=document.querySelector('.btn-copy');if(b){b.textContent='Copied!';setTimeout(()=>b.textContent='Copy',1500)}})}
+function copyResult(){fetch(resultUrl(cid)).then(r=>r.json()).then(s=>{const isPair=(cid||'').startsWith('pair_');let text='';if(isPair){const parts=s.messages||[];text=parts.filter(m=>m.role!=='architect').map(m=>`// === ${m.role} (${m.model||'unknown'}) ===\n${m.content}`).join('\n\n')}else{text=s.final_solution||s.final_plan||''}navigator.clipboard.writeText(text);const b=document.querySelector('.btn-copy');if(b){b.textContent='Copied!';setTimeout(()=>b.textContent='Copy',1500)}})}
 function sb(){$('content').scrollTop=$('content').scrollHeight}
 function $(id){return document.getElementById(id)}
 function esc(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
-loadThreads();
+setMode('auto');loadThreads();
 </script>
 </body>
 </html>
 """
 
+register_planning_v2_routes(app)
+
+
+# ── Horcrux v8 Unified API routes ──
+
+horcrux_states = {}
+
+@app.route("/api/horcrux/classify", methods=["POST"])
+def horcrux_classify():
+    """분류 미리보기 — 실행하지 않고 어떤 모드/엔진이 선택될지 확인."""
+    data = request.json
+    task = data.get("task", "").strip()
+    if not task:
+        return jsonify({"error": "task required"}), 400
+    try:
+        from core.adaptive import classify_task_complexity, build_stage_plan
+        mode_override = data.get("mode", "auto")
+        if mode_override == "auto":
+            mode_override = None
+        result = classify_task_complexity(
+            task_description=task,
+            task_type=data.get("task_type", "code"),
+            num_files_touched=data.get("num_files", 1),
+            estimated_scope=data.get("scope", "medium"),
+            risk_level=data.get("risk", "medium"),
+            artifact_type=data.get("artifact_type", "none"),
+            user_mode_override=mode_override,
+        )
+        d = result.to_dict()
+        try:
+            plan = build_stage_plan(
+                recommended_mode=result.recommended_mode,
+                task_type=data.get("task_type", "code"),
+                artifact_type=data.get("artifact_type", "none"),
+            )
+            d["stages"] = plan.enabled_stages
+        except Exception:
+            d["stages"] = []
+        return jsonify(d)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/horcrux/run", methods=["POST"])
+def horcrux_run():
+    """통합 실행 엔드포인트. classify → engine 결정 → 해당 엔진 호출."""
+    data = request.json
+    task = data.get("task", "").strip()
+    if not task:
+        return jsonify({"error": "task required"}), 400
+
+    from core.adaptive import classify_task_complexity
+
+    mode_param = data.get("mode", "auto")
+    mode_override = None if mode_param == "auto" else mode_param
+
+    classification = classify_task_complexity(
+        task_description=task,
+        task_type=data.get("task_type", "code"),
+        num_files_touched=data.get("num_files", 1),
+        estimated_scope=data.get("scope", "medium"),
+        risk_level=data.get("risk", "medium"),
+        artifact_type=data.get("artifact_type", "none"),
+        user_mode_override=mode_override,
+    )
+
+    engine = classification.internal_engine.value
+    mode = classification.recommended_mode.value
+    if mode == "full_horcrux":
+        mode = "full"
+    intent = classification.detected_intent.value
+
+    # ── 동기 엔진: adaptive_fast / adaptive_standard / adaptive_full ──
+    if engine.startswith("adaptive_"):
+        try:
+            from adaptive_orchestrator import run_adaptive
+            # map engine → mode_override for orchestrator
+            orch_mode_map = {
+                "adaptive_fast": "fast",
+                "adaptive_standard": "standard",
+                "adaptive_full": "full_horcrux",
+            }
+            result = run_adaptive(
+                task=task,
+                mode_override=orch_mode_map.get(engine),
+                task_type=data.get("task_type", "code"),
+                num_files=data.get("num_files", 1),
+                scope=data.get("scope", "medium"),
+                risk=data.get("risk", "medium"),
+                artifact_type=data.get("artifact_type", "none"),
+            )
+            return jsonify({
+                "status": "converged" if result.get("converged") else "completed",
+                "mode": mode,
+                "internal_engine": engine,
+                "score": result.get("final_score", 0),
+                "rounds": result.get("rounds", 0),
+                "solution": result.get("final_solution", ""),
+                "routing": {
+                    "source": classification.routing_source.value,
+                    "confidence": classification.confidence,
+                    "intent": intent,
+                },
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── 비동기 엔진: planning_pipeline ──
+    if engine == "planning_pipeline":
+        try:
+            r = None
+            with app.test_request_context(json={
+                "task": task,
+                "task_type": data.get("task_type", "brainstorm"),
+                "artifact_type": data.get("artifact_type", "doc"),
+                "audience": data.get("audience", "general"),
+                "tone": data.get("tone", "professional"),
+                "claude_model": data.get("claude_model", ""),
+            }):
+                # 내부적으로 planning 엔드포인트 호출
+                import requests as _req
+                resp = _req.post(f"http://localhost:5000/api/planning", json={
+                    "task": task,
+                    "task_type": data.get("task_type", "brainstorm"),
+                    "artifact_type": data.get("artifact_type", "doc"),
+                    "audience": data.get("audience", "general"),
+                    "tone": data.get("tone", "professional"),
+                    "claude_model": data.get("claude_model", ""),
+                }, timeout=10)
+                r = resp.json()
+            return jsonify({
+                "status": "running",
+                "job_id": r.get("planning_id"),
+                "internal_engine": engine,
+                "mode": mode,
+                "message": "Use check(job_id) to monitor",
+                "routing": {"source": classification.routing_source.value, "confidence": classification.confidence, "intent": intent},
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── 비동기 엔진: pair_generation ──
+    if engine == "pair_generation":
+        try:
+            pair_mode = data.get("pair_mode", "pair2")
+            import requests as _req
+            resp = _req.post(f"http://localhost:5000/api/pair", json={
+                "task": task,
+                "mode": pair_mode,
+                "output_dir": data.get("output_dir", ""),
+            }, timeout=10)
+            r = resp.json()
+            return jsonify({
+                "status": "running",
+                "job_id": r.get("pair_id"),
+                "internal_engine": engine,
+                "mode": "parallel",
+                "message": "Use check(job_id) to monitor",
+                "routing": {"source": classification.routing_source.value, "confidence": classification.confidence, "intent": intent},
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── 비동기 엔진: self_improve ──
+    if engine == "self_improve":
+        try:
+            import requests as _req
+            resp = _req.post(f"http://localhost:5000/api/self_improve", json={
+                "task": task,
+                "iterations": data.get("iterations", 3),
+            }, timeout=10)
+            r = resp.json()
+            return jsonify({
+                "status": "running",
+                "job_id": r.get("self_improve_id"),
+                "internal_engine": engine,
+                "mode": mode,
+                "message": "Use check(job_id) to monitor",
+                "routing": {"source": classification.routing_source.value, "confidence": classification.confidence, "intent": intent},
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── 비동기 엔진: debate_loop ──
+    if engine == "debate_loop":
+        try:
+            import requests as _req
+            resp = _req.post(f"http://localhost:5000/api/start", json={
+                "task": task,
+                "max_rounds": data.get("max_rounds", 5),
+                "threshold": data.get("threshold", 8.0),
+                "project_dir": data.get("project_dir", ""),
+                "claude_model": data.get("claude_model", ""),
+            }, timeout=10)
+            r = resp.json()
+            return jsonify({
+                "status": "running",
+                "job_id": r.get("debate_id"),
+                "internal_engine": engine,
+                "mode": mode,
+                "message": "Use check(job_id) to monitor",
+                "routing": {"source": classification.routing_source.value, "confidence": classification.confidence, "intent": intent},
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    return jsonify({"error": f"unknown engine: {engine}"}), 400
+
+
+@app.route("/api/horcrux/status/<job_id>")
+def horcrux_status(job_id):
+    """통합 상태 확인 — job_id prefix 기반 라우팅."""
+    state = horcrux_states.get(job_id)
+    if not state:
+        log_file = LOG_DIR / f"{job_id}.json"
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            horcrux_states[job_id] = state
+        else:
+            return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "id": state.get("id"), "status": state.get("status"),
+        "phase": state.get("phase", ""), "task": state.get("task", ""),
+        "message_count": len(state.get("messages", [])),
+        "avg_score": state.get("avg_score", 0),
+        "created_at": state.get("created_at"), "finished_at": state.get("finished_at"),
+        "error": state.get("error"),
+    })
+
+
+@app.route("/api/horcrux/result/<job_id>")
+def horcrux_result(job_id):
+    state = horcrux_states.get(job_id)
+    if not state:
+        log_file = LOG_DIR / f"{job_id}.json"
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            horcrux_states[job_id] = state
+        else:
+            return jsonify({"error": "not found"}), 404
+    return jsonify(state)
+
+
+@app.route("/api/horcrux/stop/<job_id>", methods=["POST"])
+def horcrux_stop(job_id):
+    state = horcrux_states.get(job_id)
+    if state:
+        state["status"] = "aborted"
+        state["finished_at"] = datetime.now().isoformat()
+    return jsonify({"ok": True})
+
+
+# ── Analytics API routes (Phase 3) ──
+
+@app.route("/api/analytics")
+def analytics_dashboard():
+    try:
+        from core.adaptive.analytics import build_analytics_dashboard
+        dashboard = build_analytics_dashboard()
+        return jsonify(dashboard.to_dict())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics/timeouts")
+def analytics_timeouts():
+    try:
+        from core.adaptive.analytics import compute_latency_percentiles, auto_tune_timeouts
+        stats = {k: v.to_dict() for k, v in compute_latency_percentiles().items()}
+        recommendations = auto_tune_timeouts(dry_run=True)
+        return jsonify({"stats": stats, "recommendations": recommendations})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics/timeouts/apply", methods=["POST"])
+def analytics_apply_timeouts():
+    try:
+        from core.adaptive.analytics import auto_tune_timeouts
+        applied = auto_tune_timeouts(dry_run=False)
+        return jsonify({"applied": applied, "status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics/critics")
+def analytics_critics():
+    try:
+        from core.adaptive.analytics import compute_critic_reliability
+        data = {k: v.to_dict() for k, v in compute_critic_reliability().items()}
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics/modes")
+def analytics_modes():
+    try:
+        from core.adaptive.analytics import compute_mode_usage_stats
+        data = {k: v.to_dict() for k, v in compute_mode_usage_stats().items()}
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics/heuristic")
+def analytics_heuristic():
+    try:
+        from core.adaptive.analytics import suggest_heuristic_refinements
+        data = suggest_heuristic_refinements()
+        return jsonify(data.to_dict())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
-    print("\nDebate Chain v7")
-    print("  Phase 1: subprocess shell=False + stdin (temp file 제거)")
-    print("  Phase 2: Multi-Critic(Codex+Gemini) + Synthesizer=Codex + Regression + 다차원 수렴")
-    print("  Phase 3: debate_pair 파이프라인 + self_improve + SSE 스트리밍")
-    print(f"  http://localhost:5000\n")
+    print("\nHorcrux v8 — Adaptive Single Entry Point")
+    print("  External: Auto / Fast / Standard / Full / Parallel")
+    print("  Internal: adaptive_fast/standard/full, debate_loop, planning_pipeline, pair_generation, self_improve")
+    print("  Unified endpoint: /api/horcrux/run → classify → auto-route")
+    print()
+    # Aux API 키 감지 로그
+    for name, _, env_key, model, _ in AUX_CRITIC_ENDPOINTS:
+        val = os.environ.get(env_key, "")
+        if val:
+            print(f"  [AUX] {name} ({model}): KEY SET ({env_key}={val[:8]}...)")
+        else:
+            print(f"  [AUX] {name}: KEY MISSING ({env_key})")
+    print(f"\n  http://localhost:5000")
+    print(f"  Modes: Auto | Fast | Standard | Full | Parallel\n")
     app.run(host="0.0.0.0", port=5000, debug=False)

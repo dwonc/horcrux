@@ -25,7 +25,7 @@ from .types import ToolResult
 
 # ─── 허용 경로 (file_read용) ───
 _ALLOWED_DIRS: List[Path] = [
-    Path(__file__).parent.parent,  # debate-chain 프로젝트 루트
+    Path(__file__).parent.parent,  # horcrux 프로젝트 루트
 ]
 
 
@@ -65,7 +65,7 @@ def web_search(query: str, max_results: int = 3) -> ToolResult:
 
 # ─── code_exec ───
 
-_EXEC_SANDBOX = Path(tempfile.gettempdir()) / "debate_chain_exec"
+_EXEC_SANDBOX = Path(tempfile.gettempdir()) / "horcrux_exec"
 _EXEC_SANDBOX.mkdir(exist_ok=True)
 
 _BLOCKED_IMPORTS = re.compile(

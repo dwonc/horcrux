@@ -50,7 +50,7 @@ def sanitize_prompt(prompt: str) -> str:
 def run_cli_stdin(
     cmd: list[str],
     prompt: str,
-    timeout: int = 180,
+    timeout: int = 300,
     env_extra: Optional[dict] = None,
 ) -> tuple[str, str, int]:
     """
@@ -90,7 +90,7 @@ def run_cli_stdin(
 def run_cli_tempfile(
     cmd_template: list[str],
     prompt: str,
-    timeout: int = 180,
+    timeout: int = 300,
     placeholder: str = "{prompt_file}",
 ) -> tuple[str, str, int]:
     """
@@ -104,7 +104,7 @@ def run_cli_tempfile(
 
     # 랜덤 파일명
     rand_suffix = secrets.token_hex(8)
-    tmp_dir = Path(tempfile.gettempdir()) / "debate_chain_secure"
+    tmp_dir = Path(tempfile.gettempdir()) / "horcrux_secure"
     tmp_dir.mkdir(mode=0o700, exist_ok=True)
     tmp_path = tmp_dir / f"prompt_{rand_suffix}.txt"
 

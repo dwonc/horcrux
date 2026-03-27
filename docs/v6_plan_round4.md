@@ -1,4 +1,4 @@
-# Debate Chain v6.0 기획안 (라운드 4 Synthesizer 출력)
+# Horcrux v6.0 기획안 (라운드 4 Synthesizer 출력)
 
 ## 디베이트 히스토리
 - **R1**: Claude Opus → v5.0 기획 (4 Phase 대규모)

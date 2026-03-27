@@ -1,0 +1,476 @@
+{
+  "document_type": "feature_spec_for_claude_code",
+  "title": "Horcrux Interactive Mode — Human-in-the-Loop Debate",
+  "project_root": "D:\\Custom_AI-Agent_Project\\horcrux",
+  "date": "2026-03-27",
+  "priority": "next_major_feature (mode consolidation 완료 후)",
+
+  "problem": {
+    "summary": "현재 debate loop는 batch process — 실행하면 끝까지 자동으로 돌고 사용자가 중간에 개입할 수 없음",
+    "current_flow": "run → Round 1 → Round 2 → Round 3 → 끝 → (선택) Deep Dive (새 debate 시작)",
+    "limitation": [
+      "사용자의 도메인 지식이 debate에 실시간 반영 안 됨",
+      "critic이 엉뚱한 방향으로 몰아가도 사람이 끼어들지 못함",
+      "Round 1에서 잘못된 방향이 잡히면 2~3라운드를 낭비한 후에야 알 수 있음",
+      "Deep Dive는 완료 후 재시작이라 context가 단절됨"
+    ],
+    "desired_flow": "run → Round 1 → [사용자 리뷰 + 피드백] → Round 2 (피드백 반영) → [사용자 리뷰] → Round 3 → 완료"
+  },
+
+  "solution": {
+    "name": "Interactive Mode (human-in-the-loop)",
+    "principle": "debate loop를 라운드 단위로 pause 가능한 interactive session으로 전환. 사용자가 매 라운드 후 방향을 수정하거나 특정 영역에 deep dive를 지시할 수 있음.",
+    "key_concept": "human_directive — 사용자가 주입하는 텍스트가 다음 라운드의 generator prompt에 최우선 지시로 삽입됨. critic feedback과 human directive가 동시에 generator에 전달.",
+
+    "execution_modes": {
+      "batch": {
+        "description": "기존 방식. 끝까지 자동 실행. interactive=false (기본값)",
+        "use_case": "간단한 작업, 빠른 처리가 필요한 경우"
+      },
+      "interactive": {
+        "description": "매 라운드 후 pause. 사용자가 continue/feedback/focus/stop 중 선택",
+        "use_case": "복잡한 설계, 방향 조정이 필요한 경우, 도메인 전문가가 개입할 때"
+      },
+      "semi_interactive": {
+        "description": "자동 실행하되, score가 threshold 근처(±1.0)이거나 critic disagreement가 클 때만 pause해서 사용자에게 판단 요청",
+        "use_case": "대부분 자동이되 애매한 상황에서만 사람 개입"
+      }
+    }
+  },
+
+  "session_state_model": {
+    "description": "interactive session의 상태 관리",
+    "schema": {
+      "session_id": "string (UUID)",
+      "task": "string",
+      "mode": "fast|standard|full",
+      "interactive": "batch|interactive|semi_interactive",
+      "status": "running|paused|waiting_feedback|completed|converged|aborted",
+      "current_round": "int",
+      "max_rounds": "int",
+      "rounds": [
+        {
+          "round_num": 1,
+          "generator_output": "string",
+          "critic_result": "object (score, issues, etc)",
+          "human_directive": "string|null (사용자가 주입한 피드백)",
+          "human_action": "continue|feedback|focus|stop|null",
+          "paused_at": "ISO8601|null",
+          "resumed_at": "ISO8601|null"
+        }
+      ],
+      "compact_memory": "CompactMemory object (Phase 1.5)",
+      "pending_human_directive": "string|null"
+    }
+  },
+
+  "human_actions": {
+    "description": "pause 상태에서 사용자가 선택할 수 있는 액션",
+    "actions": [
+      {
+        "name": "continue",
+        "description": "현재 방향 유지하고 다음 라운드 진행. 별도 피드백 없음.",
+        "effect": "다음 라운드 generator prompt에 human directive 없이 critic feedback만 반영"
+      },
+      {
+        "name": "feedback",
+        "description": "사용자가 자유 텍스트로 방향 수정/추가 지시를 줌",
+        "input": "human_directive: string",
+        "effect": "다음 라운드 generator prompt에 [HUMAN DIRECTIVE] 블록으로 최우선 삽입. critic feedback보다 우선.",
+        "examples": [
+          "마이크로서비스 말고 모노리포 방식으로 가",
+          "보안 부분은 됐고, 성능 최적화에 집중해줘",
+          "이 approach는 아닌 것 같아. Redis 대신 PostgreSQL로 가자",
+          "여기 좋은데, DB 스키마 부분만 더 상세하게 파줘"
+        ]
+      },
+      {
+        "name": "focus",
+        "description": "특정 영역에 deep dive. 나머지는 현재 상태 유지.",
+        "input": "focus_area: string, depth: shallow|deep",
+        "effect": "generator에 focus constraint 주입. 'preserve everything except {focus_area}. deep dive into {focus_area}.'",
+        "examples": [
+          {"focus_area": "database schema", "depth": "deep"},
+          {"focus_area": "error handling", "depth": "shallow"},
+          {"focus_area": "API response format", "depth": "deep"}
+        ]
+      },
+      {
+        "name": "stop",
+        "description": "현재 솔루션으로 확정하고 세션 종료",
+        "effect": "status → completed, final_solution = 현재 round의 best solution"
+      },
+      {
+        "name": "rollback",
+        "description": "이전 라운드의 솔루션으로 되돌리고, 새 방향으로 다시 시도",
+        "input": "rollback_to_round: int, new_directive: string",
+        "effect": "compact_memory를 해당 라운드의 checkpoint로 복원, new_directive와 함께 재시작"
+      }
+    ]
+  },
+
+  "prompt_injection_design": {
+    "description": "human_directive를 generator prompt에 어떻게 삽입하는지",
+    "prompt_template": [
+      "Task: {task}",
+      "",
+      "[HUMAN DIRECTIVE — HIGHEST PRIORITY]",
+      "{human_directive}",
+      "The above is a direct instruction from the human operator. Follow it above all other feedback.",
+      "[/HUMAN DIRECTIVE]",
+      "",
+      "{compact_memory_blocks}",
+      "",
+      "{checkpoint_from_last_round}",
+      "",
+      "{delta_prompt (critic feedback)}",
+      "",
+      "[CURRENT SOLUTION — truncated]",
+      "{solution_truncated}",
+      "",
+      "Improve the solution. The HUMAN DIRECTIVE takes precedence over critic feedback when they conflict."
+    ],
+    "priority_order": [
+      "1. human_directive (사용자 지시 — 최우선)",
+      "2. must_not_change (regression 방지)",
+      "3. blocking_issues (critic의 critical 이슈)",
+      "4. preserve (이미 통과한 부분)",
+      "5. minor improvements (critic의 minor 이슈)"
+    ],
+    "focus_mode_template": [
+      "Task: {task}",
+      "",
+      "[FOCUS CONSTRAINT]",
+      "Deep dive into: {focus_area}",
+      "Preserve everything else as-is. Do NOT modify areas outside the focus.",
+      "[/FOCUS CONSTRAINT]",
+      "",
+      "{rest of prompt}"
+    ]
+  },
+
+  "semi_interactive_auto_pause_conditions": {
+    "description": "semi_interactive 모드에서 자동으로 pause하는 조건",
+    "conditions": [
+      {
+        "name": "ambiguous_convergence",
+        "trigger": "score가 threshold ± 1.0 범위 (예: 7.0~9.0 when threshold=8.0)",
+        "message": "Score {score}/10 — threshold 근처. 이대로 진행할까요? 수정할 부분이 있으면 알려주세요."
+      },
+      {
+        "name": "critic_disagreement",
+        "trigger": "core critic 간 점수 차이 >= 2.0",
+        "message": "Critic 의견이 갈립니다. {critic_a}: {score_a}/10, {critic_b}: {score_b}/10. 어느 방향을 선호하세요?"
+      },
+      {
+        "name": "direction_change",
+        "trigger": "이번 라운드 솔루션이 이전과 semantic similarity < 0.5 (방향이 크게 바뀜)",
+        "message": "솔루션 방향이 크게 바뀌었습니다. 이 방향이 맞나요?"
+      },
+      {
+        "name": "regression_detected",
+        "trigger": "이전에 resolved된 issue가 다시 발생",
+        "message": "Regression 감지: {regressed_issue}. 이전 방식으로 되돌릴까요?"
+      },
+      {
+        "name": "max_round_approaching",
+        "trigger": "current_round == max_rounds - 1 (마지막 라운드 직전)",
+        "message": "마지막 라운드입니다. 수정할 부분이 있으면 지금 알려주세요."
+      }
+    ]
+  },
+
+  "api_design": {
+    "new_endpoints": [
+      {
+        "path": "/api/horcrux/run",
+        "method": "POST",
+        "change": "기존 spec에 interactive 파라미터 추가",
+        "additional_params": {
+          "interactive": "batch|interactive|semi_interactive (default: batch)",
+          "pause_after_round": "bool (default: false, interactive=true면 자동 true)"
+        },
+        "behavior": {
+          "batch": "기존과 동일 — 끝까지 자동 실행",
+          "interactive": "Round 1 완료 후 status='paused'로 전환. check로 현재 상태 조회 가능.",
+          "semi_interactive": "자동 실행하되 auto_pause_conditions 충족 시 pause"
+        }
+      },
+      {
+        "path": "/api/horcrux/feedback",
+        "method": "POST",
+        "description": "paused 상태의 session에 사용자 피드백 주입 + 다음 라운드 재개",
+        "request_body": {
+          "job_id": "string (required)",
+          "action": "continue|feedback|focus|stop|rollback (required)",
+          "human_directive": "string (feedback action일 때)",
+          "focus_area": "string (focus action일 때)",
+          "focus_depth": "shallow|deep (focus action일 때, default: deep)",
+          "rollback_to_round": "int (rollback action일 때)",
+          "new_directive": "string (rollback action일 때)"
+        },
+        "response": {
+          "status": "resumed|completed|error",
+          "message": "string",
+          "next_round": "int"
+        }
+      },
+      {
+        "path": "/api/horcrux/session/<job_id>",
+        "method": "GET",
+        "description": "interactive session의 상세 상태 조회 — 현재 라운드, 각 라운드별 결과, pause 이유 등",
+        "response": {
+          "session_id": "string",
+          "status": "running|paused|waiting_feedback|completed",
+          "current_round": "int",
+          "pause_reason": "string|null",
+          "rounds": "array of round objects",
+          "available_actions": ["continue", "feedback", "focus", "stop", "rollback"]
+        }
+      }
+    ],
+    "existing_endpoints_unchanged": [
+      "/api/horcrux/classify",
+      "/api/analytics/*",
+      "/api/test",
+      "기존 모든 status/result/check 엔드포인트"
+    ]
+  },
+
+  "mcp_tool_design": {
+    "file": "mcp_server.js",
+    "changes": [
+      {
+        "tool": "run",
+        "change": "interactive 파라미터 추가",
+        "new_params": {
+          "interactive": {
+            "type": "enum",
+            "options": ["batch", "interactive", "semi"],
+            "default": "batch",
+            "description": "batch=자동실행, interactive=매 라운드 pause, semi=애매할 때만 pause"
+          }
+        },
+        "response_change": "interactive/semi 모드에서는 Round 1 완료 후 '현재 상태 + 사용 가능한 액션' 안내 텍스트 반환"
+      },
+      {
+        "tool": "feedback",
+        "new_tool": true,
+        "name": "feedback",
+        "description": "Horcrux interactive session에 피드백 주입. 방향 수정(feedback), 특정 영역 집중(focus), 계속(continue), 중단(stop), 이전 라운드로 되돌리기(rollback) 가능.",
+        "params": {
+          "job_id": "string (required)",
+          "action": "continue|feedback|focus|stop|rollback (required)",
+          "message": "string (optional — feedback/focus 시 자연어 지시)",
+          "rollback_to": "number (optional — rollback 시 되돌릴 라운드)"
+        },
+        "flask_endpoint": "/api/horcrux/feedback"
+      }
+    ],
+    "tool_count_after": "run, check, classify, analytics, feedback, horcrux_test = 6개"
+  },
+
+  "claude_desktop_ux_flow": {
+    "description": "Claude Desktop에서 사용자가 interactive mode를 사용하는 실제 흐름",
+    "example_conversation": [
+      {
+        "turn": 1,
+        "user": "이 프로젝트 아키텍처를 리팩토링해줘. 호크룩스 interactive 모드로.",
+        "claude_action": "run(task='아키텍처 리팩토링', mode='full', interactive='interactive')",
+        "horcrux_response": "session started, Round 1 진행 중..."
+      },
+      {
+        "turn": 2,
+        "claude_action": "check(job_id) — Round 1 완료 확인",
+        "horcrux_response": {
+          "status": "paused",
+          "round": 1,
+          "score": "6.5/10",
+          "summary": "마이크로서비스 기반 설계 제안. API Gateway + 3개 서비스 분리.",
+          "critic_feedback": "성능 우려, DB 분리 전략 부재",
+          "available_actions": ["continue", "feedback", "focus", "stop"]
+        },
+        "claude_to_user": "Round 1 결과:\n- 마이크로서비스 기반 설계 (6.5/10)\n- Critic: 성능 우려, DB 분리 전략 부재\n\n이대로 진행할까요? 수정할 부분이 있으면 알려주세요."
+      },
+      {
+        "turn": 3,
+        "user": "마이크로서비스 말고 모듈러 모노리스로 가자. 지금 팀 규모에 마이크로서비스는 과해.",
+        "claude_action": "feedback(job_id, action='feedback', message='마이크로서비스 말고 모듈러 모노리스로 전환. 팀 규모(4명)에 맞는 아키텍처.')",
+        "horcrux_response": "Round 2 시작 — human directive 반영됨"
+      },
+      {
+        "turn": 4,
+        "claude_action": "check(job_id) — Round 2 완료 확인",
+        "horcrux_response": {
+          "status": "paused",
+          "round": 2,
+          "score": "8.2/10",
+          "summary": "모듈러 모노리스 설계. 4개 모듈 분리, shared DB, 모듈 간 이벤트 버스.",
+          "critic_feedback": "good, minor: 이벤트 버스 구현 상세 필요"
+        },
+        "claude_to_user": "Round 2 결과:\n- 모듈러 모노리스 (8.2/10) ✅\n- 방향이 잘 잡혔습니다. 이벤트 버스 부분만 minor 이슈.\n\n이대로 확정할까요? 아니면 이벤트 버스 부분을 더 파볼까요?"
+      },
+      {
+        "turn": 5,
+        "user": "이벤트 버스 부분만 더 파줘",
+        "claude_action": "feedback(job_id, action='focus', message='이벤트 버스 구현 상세 — in-process vs message queue')",
+        "horcrux_response": "Round 3 시작 — focus: 이벤트 버스"
+      },
+      {
+        "turn": 6,
+        "claude_action": "check(job_id) — Round 3 완료",
+        "horcrux_response": {
+          "status": "paused",
+          "round": 3,
+          "score": "9.1/10",
+          "summary": "이벤트 버스: MediatR 패턴 in-process → 나중에 RabbitMQ 전환 가능한 추상화 계층"
+        },
+        "claude_to_user": "Round 3 (9.1/10) ✅\n이벤트 버스: MediatR in-process + 추상화 계층으로 나중에 MQ 전환 가능.\n\n이걸로 확정할까요?"
+      },
+      {
+        "turn": 7,
+        "user": "좋아 확정",
+        "claude_action": "feedback(job_id, action='stop')",
+        "horcrux_response": "session completed. final_solution 저장."
+      }
+    ]
+  },
+
+  "implementation_design": {
+    "core_changes": [
+      {
+        "file": "adaptive_orchestrator.py",
+        "changes": [
+          "_run_standard()과 _run_full_horcrux()에 interactive loop 추가",
+          "기존 for round in range(1, cap+1) 루프를 pause/resume 가능하게 리팩토링",
+          "InteractiveSession 클래스 추가 — session state + pause/resume + feedback injection",
+          "CompactMemory에 human_directive를 주입하는 메서드 추가"
+        ]
+      },
+      {
+        "file": "core/adaptive/compact_memory.py",
+        "changes": [
+          "build_revision_prompt()에 human_directive 파라미터 추가",
+          "human_directive가 있으면 [HUMAN DIRECTIVE] 블록을 prompt 최상단에 삽입",
+          "focus_constraint 파라미터 추가 — focus mode 시 preserve + focus 분리"
+        ]
+      },
+      {
+        "file": "server.py",
+        "changes": [
+          "/api/horcrux/feedback 엔드포인트 추가",
+          "/api/horcrux/session/<id> 엔드포인트 추가",
+          "/api/horcrux/run에 interactive 파라미터 처리 추가",
+          "interactive session state를 메모리(dict)로 관리 (기존 debates dict와 동일 패턴)"
+        ]
+      },
+      {
+        "file": "mcp_server.js",
+        "changes": [
+          "run 도구에 interactive 파라미터 추가",
+          "feedback 도구 신규 추가",
+          "check 도구에서 paused 상태일 때 available_actions 표시"
+        ]
+      }
+    ],
+    "new_classes": [
+      {
+        "name": "InteractiveSession",
+        "location": "adaptive_orchestrator.py 또는 core/adaptive/interactive.py",
+        "responsibilities": [
+          "session state 관리 (rounds, checkpoints, human_directives)",
+          "pause/resume 제어 (threading.Event 기반)",
+          "human_directive를 CompactMemory에 주입",
+          "auto_pause_conditions 체크 (semi_interactive용)",
+          "rollback (checkpoint 복원)"
+        ],
+        "key_methods": [
+          "start_round(round_num) → 라운드 실행",
+          "pause() → 현재 라운드 완료 후 대기",
+          "resume(action, directive) → 다음 라운드 시작",
+          "inject_feedback(human_directive) → memory에 주입",
+          "rollback(to_round) → checkpoint 복원",
+          "should_auto_pause(critic_result) → semi_interactive 조건 체크"
+        ]
+      }
+    ]
+  },
+
+  "compact_memory_integration": {
+    "description": "human_directive가 CompactMemory 시스템과 어떻게 통합되는지",
+    "flow": [
+      "1. 사용자가 feedback(action='feedback', message='모듈러 모노리스로 가자') 전송",
+      "2. InteractiveSession이 human_directive를 받음",
+      "3. CompactMemory.working_memory.must_not_change에 '이전 human directive 결정' 추가",
+      "4. CompactMemory.decision_memory에 {topic: 'architecture', choice: '모듈러 모노리스', reason: 'human directive'} 추가",
+      "5. build_revision_prompt()가 [HUMAN DIRECTIVE] 블록을 최상단에 삽입",
+      "6. generator가 human directive + critic feedback + preserve를 모두 반영한 솔루션 생성"
+    ],
+    "human_directive_vs_critic_conflict": {
+      "rule": "human_directive가 critic feedback과 충돌하면 human_directive 우선",
+      "example": "critic이 '마이크로서비스 권장'이라고 했는데 사용자가 '모듈러 모노리스'로 지시하면 → 모듈러 모노리스로 감",
+      "implementation": "prompt에서 'The HUMAN DIRECTIVE takes precedence over critic feedback when they conflict.' 명시"
+    }
+  },
+
+  "implementation_order": [
+    "1. InteractiveSession 클래스 설계 + 구현 (core/adaptive/interactive.py)",
+    "2. compact_memory.py에 human_directive 주입 메서드 추가",
+    "3. adaptive_orchestrator.py의 _run_standard/_run_full에 interactive loop 통합",
+    "4. server.py에 /api/horcrux/feedback, /api/horcrux/session 엔드포인트 추가",
+    "5. mcp_server.js에 feedback 도구 추가 + run에 interactive 파라미터",
+    "6. 테스트: interactive 세션 생성 → pause → feedback → resume → 결과 확인"
+  ],
+
+  "prerequisite": "mode_consolidation_spec.json의 작업이 먼저 완료되어야 함 (통합 /api/horcrux/run 엔드포인트 필요)",
+
+  "test_scenarios": [
+    {
+      "name": "basic_interactive_flow",
+      "steps": [
+        "run(interactive='interactive') → Round 1 → pause",
+        "feedback(action='continue') → Round 2 → pause",
+        "feedback(action='stop') → completed"
+      ]
+    },
+    {
+      "name": "direction_change",
+      "steps": [
+        "run(interactive='interactive') → Round 1 → pause",
+        "feedback(action='feedback', message='방향 전환') → Round 2 (방향 반영) → pause",
+        "check → Round 2 결과에 human directive가 반영되었는지 확인"
+      ]
+    },
+    {
+      "name": "focus_deep_dive",
+      "steps": [
+        "run(interactive='interactive') → Round 1 → pause",
+        "feedback(action='focus', message='DB 스키마') → Round 2 (DB 부분만 상세화) → pause",
+        "check → DB 외 영역은 Round 1과 동일한지 확인"
+      ]
+    },
+    {
+      "name": "rollback",
+      "steps": [
+        "run(interactive='interactive') → Round 1 → continue → Round 2 → pause",
+        "feedback(action='rollback', rollback_to=1, message='다른 approach') → Round 2 재시작",
+        "check → Round 1 checkpoint 기반 + 새 directive로 재생성되었는지 확인"
+      ]
+    },
+    {
+      "name": "semi_interactive_auto_pause",
+      "steps": [
+        "run(interactive='semi') → Round 1 auto → Round 2 (critic disagreement) → auto pause",
+        "check → pause_reason이 'critic_disagreement'인지 확인",
+        "feedback(action='feedback', message='critic A 방향으로') → Round 3 → converged"
+      ]
+    }
+  ],
+
+  "future_enhancements": [
+    "streaming: 라운드 진행 중에도 SSE로 실시간 진행 상황 표시",
+    "multi-user: 여러 사람이 같은 session에 feedback을 줄 수 있는 collaborative mode",
+    "voice: Claude Desktop voice input → feedback 자동 전환",
+    "branch: 같은 checkpoint에서 여러 방향으로 분기 → 비교 후 best 선택"
+  ]
+}

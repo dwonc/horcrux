@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Horcrux — Planning (Layer 3)</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+.container{max-width:900px;margin:0 auto;padding:20px}
+h1{color:#58a6ff;font-size:1.5rem;margin-bottom:20px}
+h1 a{color:#8b949e;text-decoration:none;font-size:0.8rem;margin-left:12px}
+h1 a:hover{color:#58a6ff}
+.form-group{margin-bottom:12px}
+label{display:block;color:#8b949e;font-size:0.85rem;margin-bottom:4px}
+textarea,select,input[type=text],input[type=number]{width:100%;padding:10px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:0.9rem;font-family:inherit}
+textarea{height:120px;resize:vertical}
+select{cursor:pointer}
+.row{display:flex;gap:12px}
+.row .form-group{flex:1}
+.btn{padding:10px 24px;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;font-weight:600;transition:all 0.2s}
+.btn-primary{background:#238636;color:#fff}
+.btn-primary:hover{background:#2ea043}
+.btn-primary:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
+.btn-stop{background:#da3633;color:#fff;display:none;margin-left:8px}
+.btn-stop:hover{background:#f85149}
+.btn-back{background:#30363d;color:#c9d1d9;text-decoration:none;display:inline-block;margin-bottom:16px;padding:6px 14px;border-radius:6px;font-size:0.85rem}
+.btn-back:hover{background:#484f58}
+.actions{margin-top:12px;display:flex;align-items:center;gap:8px}
+#status{margin-top:20px;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;display:none}
+#status .phase{color:#58a6ff;font-weight:600}
+#status .score{color:#f0883e;font-weight:600}
+#messages{margin-top:16px}
+.msg{padding:10px 14px;margin-bottom:8px;border-radius:6px;border-left:3px solid #30363d;background:#161b22;font-size:0.85rem;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto}
+.msg.generator{border-left-color:#58a6ff}
+.msg.synthesizer{border-left-color:#a371f7}
+.msg.critic{border-left-color:#f0883e}
+.msg.revision{border-left-color:#3fb950}
+.msg.diagnostics{border-left-color:#8b949e}
+.msg.artifact_spec{border-left-color:#d2a8ff}
+.msg.artifact_critic{border-left-color:#f0883e}
+.msg.artifact_rendered{border-left-color:#3fb950}
+.msg .role{font-weight:700;font-size:0.8rem;text-transform:uppercase;margin-bottom:4px}
+.msg .role.generator{color:#58a6ff}
+.msg .role.synthesizer{color:#a371f7}
+.msg .role.critic{color:#f0883e}
+.msg .role.revision{color:#3fb950}
+.msg .role.artifact_spec{color:#d2a8ff}
+.msg .role.artifact_rendered{color:#3fb950}
+#result{margin-top:16px;padding:14px;background:#0d1117;border:2px solid #238636;border-radius:8px;display:none;white-space:pre-wrap;word-break:break-word;max-height:500px;overflow-y:auto;font-size:0.85rem}
+</style>
+</head>
+<body>
+<div class="container">
+<a class="btn-back" href="/">← Back to Debate</a>
+<h1>Planning Pipeline (Layer 3)</h1>
+
+<div class="form-group">
+<label>Task</label>
+<textarea id="taskInput" placeholder="예: WSY 할인꿀팁 앱 리텐션 개선 전략 수립 → PPT 발표자료 생성"></textarea>
+</div>
+
+<div class="row">
+<div class="form-group">
+<label>Task Type</label>
+<select id="taskType">
+<option value="brainstorm">Brainstorm (아이디어 발산)</option>
+<option value="portfolio">Portfolio (내용 재구성)</option>
+<option value="hybrid" selected>Hybrid (기획 → 아티팩트)</option>
+<option value="artifact_only">Artifact Only (기존 내용 렌더링)</option>
+</select>
+</div>
+<div class="form-group">
+<label>Artifact Type</label>
+<select id="artifactType">
+<option value="doc" selected>Document</option>
+<option value="ppt">Presentation (PPT)</option>
+<option value="pdf">PDF</option>
+<option value="readme">README</option>
+</select>
+</div>
+</div>
+
+<div class="row">
+<div class="form-group">
+<label>Audience</label>
+<input type="text" id="audience" value="general" placeholder="investors, developers, team...">
+</div>
+<div class="form-group">
+<label>Tone</label>
+<select id="tone">
+<option value="professional" selected>Professional</option>
+<option value="casual">Casual</option>
+<option value="technical">Technical</option>
+</select>
+</div>
+<div class="form-group">
+<label>Claude Model</label>
+<select id="claudeModel">
+<option value="" selected>Auto (Opus)</option>
+<option value="opus">Opus 4.6</option>
+<option value="sonnet">Sonnet 4.6</option>
+</select>
+</div>
+</div>
+
+<div class="row">
+<div class="form-group">
+<label>Threshold</label>
+<input type="number" id="threshold" value="7.5" min="1" max="10" step="0.5">
+</div>
+<div class="form-group">
+<label>Max Rounds</label>
+<input type="number" id="maxRounds" value="3" min="1" max="10">
+</div>
+</div>
+
+<div class="actions">
+<button class="btn btn-primary" id="btnRun" onclick="runPlanning()">Run Planning</button>
+<button class="btn btn-stop" id="btnStop" onclick="stopPlanning()">Stop</button>
+</div>
+
+<div id="status"></div>
+<div id="messages"></div>
+<div id="result"></div>
+</div>
+
+<script>
+let planId=null,pt=null,lmc=0;
+
+async function runPlanning(){
+  const task=$('taskInput').value.trim();
+  if(!task)return alert('Task를 입력하세요');
+  $('btnRun').disabled=true;
+  $('btnStop').style.display='inline-block';
+  $('status').style.display='block';
+  $('status').innerHTML='Starting...';
+  $('messages').innerHTML='';
+  $('result').style.display='none';
+  lmc=0;
+  const body={
+    task:task,
+    task_type:$('taskType').value,
+    artifact_type:$('artifactType').value,
+    audience:$('audience').value,
+    tone:$('tone').value,
+    claude_model:$('claudeModel').value,
+    threshold:parseFloat($('threshold').value)||7.5,
+    max_rounds:parseInt($('maxRounds').value)||3,
+  };
+  try{
+    const r=await fetch('/api/planning',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    planId=d.planning_id;
+    if(!planId){$('status').innerHTML='Error: '+JSON.stringify(d);return}
+    pt=setInterval(poll,2000);
+  }catch(e){$('status').innerHTML='Error: '+e}
+}
+
+async function poll(){
+  if(!planId)return;
+  try{
+    const sr=await(await fetch('/api/planning/status/'+planId)).json();
+    const phase=sr.phase||'';
+    const detail=sr.phase_detail||'';
+    const score=sr.avg_score||0;
+    const status=sr.status||'';
+    $('status').innerHTML=`<span class="phase">${phase}</span> ${detail} <span class="score">${score?score.toFixed(1)+'/10':''}</span>`;
+    // messages
+    const fr=await(await fetch('/api/planning/result/'+planId)).json();
+    const msgs=fr.messages||[];
+    if(msgs.length>lmc){
+      for(let i=lmc;i<msgs.length;i++){
+        const m=msgs[i];
+        const role=m.role||'unknown';
+        const model=m.model||'';
+        const scoreStr=m.score?` (${m.score}/10)`:'';
+        const div=document.createElement('div');
+        div.className='msg '+role;
+        div.innerHTML=`<div class="role ${role}">${role}${model?' — '+model:''}${scoreStr}</div>${esc(m.content||'')}`;
+        $('messages').appendChild(div);
+      }
+      lmc=msgs.length;
+      $('messages').lastChild?.scrollIntoView({behavior:'smooth'});
+    }
+    if(status!=='running'){
+      clearInterval(pt);pt=null;
+      $('btnRun').disabled=false;
+      $('btnStop').style.display='none';
+      $('status').innerHTML+=` <b>[${status}]</b>`;
+      if(fr.final_solution){
+        $('result').style.display='block';
+        $('result').textContent=fr.final_solution;
+      }
+    }
+  }catch(e){console.error(e)}
+}
+
+async function stopPlanning(){
+  if(planId)await fetch('/api/planning/stop/'+planId,{method:'POST'});
+}
+
+function $(id){return document.getElementById(id)}
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+</script>
+</body>
+</html>

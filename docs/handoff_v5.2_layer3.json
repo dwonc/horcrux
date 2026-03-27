@@ -1,0 +1,92 @@
+{
+  "handoff_type": "session_continuation",
+  "created": "2026-03-26",
+  "project": "D:\\Custom_AI-Agent_Project\\horcrux",
+
+  "completed_this_session": {
+    "layer_3_implementation": {
+      "status": "DONE",
+      "files_created": [
+        "planning_v2.py (51KB) — Layer 3 전체 구현",
+        "web_ui/planning.html — Planning 전용 UI"
+      ],
+      "files_modified": [
+        "server.py — planning_v2 import, normalize_critic_output 연결, /planning 라우트",
+        "mcp_server.py — planning 툴 Layer 3 파라미터, 핸들러 업데이트, v5.2",
+        "CHANGELOG.md — v5.2 섹션 추가",
+        "GUIDE.md — Layer 3 아키텍처 + Planning API 추가"
+      ]
+    },
+
+    "layer_3_details": {
+      "new_prompts": [
+        "SYNTH_PROMPT_V2 — content_profile용 통합",
+        "CONTENT_GENERATOR_PROMPT — 3모델 독립 생성",
+        "CONTENT_CRITIC_PROMPT — content 전용 critic",
+        "CONTENT_IMPROVE_PROMPT — blocker 중심 revision",
+        "ARTIFACT_SPEC_BUILDER_PROMPT — content → spec 변환",
+        "ARTIFACT_CRITIC_PROMPT — spec 품질 검증",
+        "ARTIFACT_RENDERER_PROMPT — drift 금지 렌더링"
+      ],
+      "new_functions": [
+        "run_planning_harness() — 통합 엔트리포인트",
+        "build_content_finalize_package() — artifact 핸드오프",
+        "build_artifact_spec() — content → JSON spec",
+        "validate_artifact_spec() — preserve/must_not_change 검사",
+        "render_artifact() — spec → 최종 출력",
+        "_run_content_generators() — 3모델 병렬 생성",
+        "_run_content_synthesizer() — 통합",
+        "_run_content_multi_critic() — Core+Aux 병렬 critic"
+      ],
+      "api_endpoints": [
+        "POST /api/planning — task_type, artifact_type, audience, tone, threshold, max_rounds",
+        "GET /api/planning/status/{id}",
+        "GET /api/planning/result/{id}",
+        "POST /api/planning/stop/{id}",
+        "GET /planning — Layer 3 전용 Web UI"
+      ]
+    },
+
+    "normalize_critic_wiring": {
+      "status": "DONE",
+      "change": "run_multi_critic() 내부에서 normalize_critic_output() 실제 호출",
+      "details": "codex_data/gemini_data → codex_norm/gemini_norm으로 변환, aux도 동일, 반환값에 normalized_critics 필드 추가"
+    },
+
+    "mcp_upgrade": {
+      "status": "DONE",
+      "version": "5.2",
+      "changes": "planning 툴에 task_type/artifact_type/audience/tone 파라미터, 결과 포맷 Layer 3 대응"
+    }
+  },
+
+  "pending_cleanup": {
+    "manual_delete_required": [
+      "start_full.bat — 레거시",
+      "server_patch.py — monkey-patch 레거시",
+      "server_planning_patch.py — import 제거 완료, 파일 삭제 필요",
+      "mcp_server.js — Node.js 버전, py로 교체됨",
+      "planning.py — v1 레거시 (planning_v2.py로 교체됨)"
+    ]
+  },
+
+  "current_file_state": {
+    "server.py": "95KB, planning_v2 import, normalize_critic 연결, /planning 라우트",
+    "planning_v2.py": "51KB, Layer 3 전체 (content_profile + artifact_profile)",
+    "mcp_server.py": "31KB, v5.2 Layer 3 planning 지원",
+    "web_ui/planning.html": "Planning 전용 UI (task_type/artifact_type/audience/tone)",
+    ".env": "GEMINI + GROQ + DEEPSEEK + OPENROUTER 키",
+    "CHANGELOG.md": "v5.2 추가",
+    "GUIDE.md": "Layer 3 아키텍처 + API 문서 추가"
+  },
+
+  "next_session_todo": [
+    "1. 수동 레거시 파일 삭제 (5개)",
+    "2. 실제 서버 실행 테스트 (python server.py → http://localhost:5000/planning)",
+    "3. planning brainstorm/hybrid 실제 실행 + 결과 확인",
+    "4. artifact_profile PPT spec → 실제 PPT 파일 렌더링 연동 (python-pptx)",
+    "5. artifact_profile PDF → 실제 PDF 파일 렌더링 연동",
+    "6. Web UI 메인 페이지 Planning 모드에도 Layer 3 드롭다운 추가 (선택)",
+    "7. planning_v2.py 프롬프트 튜닝 (실제 실행 결과 기반)"
+  ]
+}

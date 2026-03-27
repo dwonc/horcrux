@@ -1,4 +1,4 @@
-# Debate Chain v7.0 — 최종 기획안 (R4 Synthesizer)
+# Horcrux v7.0 — 최종 기획안 (R4 Synthesizer)
 
 ## 디베이트 진화 과정
 - v5.0: 4 Phase 대규모 → GPT 5/10, Gemini 7/10 (과도한 범위)

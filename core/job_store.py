@@ -99,7 +99,7 @@ class SQLiteJobStore:
     );
     """
 
-    def __init__(self, db_path: str | Path = "debate_chain.db"):
+    def __init__(self, db_path: str | Path = "horcrux.db"):
         self.db_path = Path(db_path)
         self._local = threading.local()
         self._write_lock = threading.Lock()
@@ -288,6 +288,6 @@ _store: Optional[SQLiteJobStore] = None
 def get_store(db_path: str | Path | None = None) -> SQLiteJobStore:
     global _store
     if _store is None:
-        path = db_path or Path(__file__).parent.parent / "debate_chain.db"
+        path = db_path or Path(__file__).parent.parent / "horcrux.db"
         _store = SQLiteJobStore(path)
     return _store
