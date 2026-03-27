@@ -7,7 +7,7 @@ cd /d "%~dp0"
 echo.
 echo  ================================================
 echo   Horcrux - Multi-AI Orchestration System
-echo   Modes: Debate / Planning / Adaptive / Pair2 / Pair3
+echo   Modes: Auto / Fast / Standard / Full / Parallel
 echo  ================================================
 echo.
 

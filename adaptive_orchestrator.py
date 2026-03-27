@@ -35,6 +35,8 @@ from core.adaptive import (
     StageStatus, StageResult, TimeoutBudgetResult,
     REVISION_HARD_CAP,
     CompactMemory,
+    should_run_aux_critics,
+    execute_fallback_chain, FallbackContext, FallbackAction,
 )
 from core.provider import (
     ProviderBackend, ProviderResponse,
@@ -447,6 +449,37 @@ def _run_standard(
         if critic_budget.unresolved_flag:
             critic_text = "[UNRESOLVED] critic timed out after retry"
             critic_score = prev_score if prev_score > 0 else 5.0
+
+        # Phase 2: conditional aux critics
+        aux_decision = should_run_aux_critics(
+            mode=HorcruxMode.STANDARD.value,
+            core_scores=[critic_score],
+            critical_count=len(memory.working.blocking_issues),
+            risk_level=config.get("adaptive", {}).get("risk", "medium"),
+        )
+        if aux_decision.should_run:
+            print(f"    [3b] Aux Critics (reason: {aux_decision.reason})...")
+            try:
+                aux_providers = make_auxiliary()
+                aux_scores = []
+                for name, provider in aux_providers.items():
+                    try:
+                        aux_resp = provider.invoke(critic_prompt, timeout=60)
+                        if aux_resp.ok:
+                            aux_score = _parse_score(aux_resp.text)
+                            aux_scores.append(aux_score)
+                            print(f"        → {name}: {aux_score}/10")
+                    except Exception:
+                        pass
+                if aux_scores:
+                    # Weighted: Core × 0.8 + Aux avg × 0.2
+                    aux_avg = sum(aux_scores) / len(aux_scores)
+                    critic_score = critic_score * 0.8 + aux_avg * 0.2
+                    print(f"        → Combined: {critic_score:.1f}/10")
+            except Exception:
+                pass
+        else:
+            print(f"    [3b] Aux skipped: {aux_decision.reason}")
 
         # Phase 1.5: compact memory 업데이트 + checkpoint 생성
         memory.update_from_critic(

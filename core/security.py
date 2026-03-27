@@ -47,6 +47,24 @@ def sanitize_prompt(prompt: str) -> str:
     return prompt
 
 
+_NPM_GLOBAL = os.path.join(os.environ.get("APPDATA", ""), "npm")
+
+
+def _resolve_cli(cmd: list[str]) -> list[str]:
+    """Windows에서 npm 글로벌 CLI(.cmd)를 자동 resolve."""
+    if os.name != "nt" or not cmd:
+        return cmd
+    exe = cmd[0]
+    # 이미 풀패스면 그대로
+    if os.path.isfile(exe):
+        return cmd
+    # .cmd 확장자 추가해서 npm 글로벌에서 찾기
+    cmd_path = os.path.join(_NPM_GLOBAL, f"{exe}.cmd")
+    if os.path.isfile(cmd_path):
+        return [cmd_path] + cmd[1:]
+    return cmd
+
+
 def run_cli_stdin(
     cmd: list[str],
     prompt: str,
@@ -58,6 +76,7 @@ def run_cli_stdin(
     Returns: (stdout, stderr, returncode)
     """
     prompt = sanitize_prompt(prompt)
+    cmd = _resolve_cli(cmd)
 
     env = {**os.environ}
     if env_extra:

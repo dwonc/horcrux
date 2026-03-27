@@ -1005,8 +1005,13 @@ def run_planning_harness(planning_id: str, task: str, task_type: str = "hybrid",
                     content[:2000], critic_merged, diagnostics, last_generator_data
                 )
 
+                # BUG-4 fix: content를 8000자로 truncate, timeout 300초, 변경분만 출력 지시
+                _content_for_rev = content[:8000]
+                if len(content) > 8000:
+                    _content_for_rev += f"\n\n[... TRUNCATED {len(content) - 8000} chars. Focus on fixing issues above, do NOT reproduce the full document. Only output changed sections with context.]"
+
                 improve_prompt = CONTENT_IMPROVE_PROMPT.format(
-                    task=task, content=content,
+                    task=task, content=_content_for_rev,
                     blocking_issues=_format_issues_compact(rev_focus.get("blocking_issues", [])),
                     regressions="\n".join(str(rr) for rr in rev_focus.get("regressions", [])) or "None",
                     worst_dimensions=", ".join(rev_focus.get("worst_dimensions", [])) or "None",
@@ -1019,7 +1024,7 @@ def run_planning_harness(planning_id: str, task: str, task_type: str = "hybrid",
                     previously_fixed=prev_text,
                 )
 
-                raw = _call_claude(improve_prompt, 900, claude_model)
+                raw = _call_claude(improve_prompt, 300, claude_model)
                 jd = _extract_json(raw)
                 if jd and "content" in jd:
                     content = jd["content"]
