@@ -1081,16 +1081,22 @@ def run_planning_harness(planning_id: str, task: str, task_type: str = "hybrid",
                     previously_fixed=prev_text,
                 )
 
-                raw = _call_claude(improve_prompt, 300, claude_model)
-                jd = _extract_json(raw)
-                if jd and "content" in jd:
-                    content = jd["content"]
-                    last_generator_data = jd
-                elif jd and "solution" in jd:
-                    content = jd["solution"]
-                    last_generator_data = jd
+                raw = _call_claude(improve_prompt, 600, claude_model)
+                if raw and not raw.startswith("[ERROR]") and not raw.startswith("[TIMEOUT]"):
+                    jd = _extract_json(raw)
+                    if jd and "content" in jd:
+                        content = jd["content"]
+                        last_generator_data = jd
+                    elif jd and "solution" in jd:
+                        content = jd["solution"]
+                        last_generator_data = jd
+                    else:
+                        content = raw
                 else:
-                    content = raw
+                    # timeout/error fallback: 현재 content 유지하고 다음 라운드로
+                    import sys
+                    sys.stderr.write(f"  [REVISION] R{r} Claude failed: {raw[:100] if raw else 'empty'} — keeping current content\n")
+                    sys.stderr.flush()
 
                 # 이전 이슈 기록
                 for iss in critic_merged.get("issues", []):
