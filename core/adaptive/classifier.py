@@ -439,15 +439,24 @@ def classify_task_complexity(
             )
         try:
             mode = HorcruxMode(user_mode_override)
-            # override 시에도 intent 기반 engine 결정
-            final_mode, engine = _route_intent_to_engine(
-                detected_intent, mode, artifact_type, estimated_scope, risk_level,
-            )
-            # 사용자가 명시한 mode를 존중하되 engine은 intent 기반
+            # override 시 사용자가 지정한 mode를 최우선 존중
+            # intent가 mode를 덮어쓰지 않도록 mode → engine 직접 매핑
+            _mode_to_engine = {
+                HorcruxMode.FAST: InternalEngine.ADAPTIVE_FAST,
+                HorcruxMode.STANDARD: InternalEngine.ADAPTIVE_STANDARD,
+                HorcruxMode.FULL_HORCRUX: InternalEngine.ADAPTIVE_FULL,
+                HorcruxMode.FULL: InternalEngine.ADAPTIVE_FULL,
+            }
+            engine = _mode_to_engine.get(mode, InternalEngine.ADAPTIVE_STANDARD)
+
+            # 단, brainstorm/artifact intent는 planning이 더 적합하므로 예외 허용
+            if detected_intent in (DetectedIntent.BRAINSTORM, DetectedIntent.ARTIFACT, DetectedIntent.DOCUMENT):
+                engine = InternalEngine.PLANNING_PIPELINE
+
             return ClassificationResult(
                 recommended_mode=mode,
                 routing_source=RoutingSource.OVERRIDE,
-                reason=f"user override → {mode.value}, intent={detected_intent.value}",
+                reason=f"user override → {mode.value} (engine={engine.value}), intent={detected_intent.value}",
                 confidence=1.0,
                 internal_engine=engine,
                 detected_intent=detected_intent,
