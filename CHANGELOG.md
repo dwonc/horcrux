@@ -1,5 +1,87 @@
 # Horcrux Changelog
 
+## v8.2.0 — 2026-03-28
+
+### Deep Refactor 모드 — 멀티모델 코드 리팩토링 분석 엔진
+
+코드 생성이 아닌 **기존 코드의 리팩토링 분석**에 특화된 새 엔진. 3개 모델이 각각 독립적으로 전체 소스코드를 분석하고, 5개 모델이 크리틱-리비전 루프로 검증.
+
+#### 신규 파일
+| 파일 | 내용 |
+|------|------|
+| `deep_refactor.py` | 5-phase 파이프라인: auto-split → 병렬 분석 → 종합 → 크리틱 루프 → 결과 |
+
+#### 핵심 기능
+
+**Auto-Split (Phase 0)**
+- 프로젝트 file tree를 Claude가 분석하여 모듈 그룹으로 자동 분할
+- 작은 프로젝트(≤50K)는 분할 없이 단일 그룹으로 처리
+- Claude 분할 실패 시 디렉토리 기반 fallback 분할
+- 최대 6그룹, 그룹당 50K chars
+
+**병렬 분석 (Phase 1)**
+- 그룹별 × 3모델(Claude/Codex/Gemini) = 최대 18개 동시 분석
+- 각 모델이 다른 관점에서 분석: 아키텍처 / 코드 품질 / 유지보수성
+- 기존 8K 제한 → 그룹당 50K, 전체 프로젝트 100% 커버
+
+**크리틱-리비전 루프 (Phase 3)**
+- 5개 모델(Claude + Codex + Gemini + Groq + DeepSeek) 병렬 크리틱
+- 수렴까지 최대 3라운드 반복
+
+#### server.py 변경
+- `deep_refactor.py` import 및 의존성 주입 (`inject_drf_callers`)
+- `/api/horcrux/run`에 `deep_refactor` 엔진 라우팅 추가
+- `horcrux_status`, `horcrux_result`에서 `drf_` prefix 인식
+- Web UI `statusUrl`에 `drf_` prefix 추가
+
+#### classifier.py 변경
+- `InternalEngine.DEEP_REFACTOR` 추가
+- `DetectedIntent.DEEP_REFACTOR` 추가
+- `mode="deep_refactor"` override 시 직접 라우팅
+
+#### start.bat 변경
+- 모드 표시에 "Deep Refactor" 추가
+
+---
+
+### Pair 모드 Architect 프롬프트 강화
+
+Parallel(pair) 모드에서 두 파트 간 인터페이스 불일치 문제 해결을 위해 architect 프롬프트를 대폭 강화.
+
+#### SPLIT_PROMPT 변경
+- `shared_spec`에 4개 필드 요구: `interfaces`(클래스/함수 시그니처 + 타입), `imports`(정확한 import문), `conventions`(config 패턴, 네이밍), `shared_files`(파일 소유권)
+- 각 part에 `owns` 필드 추가 — 담당 파일 명시
+
+#### PART_PROMPT 변경
+- shared spec 준수 룰 5개 추가
+- 클래스명, 시그니처, import 패턴 변경 금지 명시
+- 자기 파트 파일만 작성하도록 제한
+
+---
+
+### Analytics 전면 확장 — 모든 로그 타입 집계
+
+기존에 `*_result.json` 패턴(adaptive 모드)만 읽던 analytics를 모든 로그 타입으로 확장.
+
+#### analytics.py 변경
+- `compute_critic_reliability()`: `*.json` 전체 스캔. debate(`messages[].score` vs `avg_score`), adaptive(`history[].score` vs `final_score`) 모두 집계
+- `compute_mode_usage_stats()`: `*.json` 전체 스캔. `_infer_mode()` 추가 — id prefix, status 등에서 모드 자동 추론
+- `_guess_critic_model()` 헬퍼 추가 — critic 텍스트에서 모델명 추정
+- `datetime` import 추가 (버그 수정)
+- 결과: 기존 3/10 리뷰 → **417개 리뷰** 집계
+
+#### Scoring 가중치 자동 튜닝
+- `server.py`에 `_maybe_auto_tune_scoring()` 추가
+- debate, pair, self_improve, adaptive 4곳 완료 시 호출
+- 10회 완료마다 `auto_tune_scoring_weights(dry_run=False)` 실행 → `config.json` 자동 반영
+- 서버 콘솔에 `[AUTO-TUNE]` 로그 출력
+
+#### 적용 결과
+- `core_weight`: 0.8 → **0.6** (critic 데이터 기반 자동 산출)
+- `aux_weight`: 0.2 → **0.4**
+
+---
+
 ## v8.0.0 — 2026-03-27
 
 ### Adaptive Single Entry Point — 외부 인터페이스 통합 리팩토링

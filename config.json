@@ -1,35 +1,48 @@
 {
   "version": "5.3",
   "description": "2-Pair Core (Claude Opus 4.6 + Codex 5.4) + Open Source Auxiliary + Adaptive Horcrux",
-
   "core_pair": {
     "a": {
       "provider": "claude-cli",
       "model": "opus-4.6",
-      "roles": ["generator", "judge", "synthesizer"]
+      "roles": [
+        "generator",
+        "judge",
+        "synthesizer"
+      ]
     },
     "b": {
       "provider": "codex-cli",
       "model": "codex-5.4",
-      "roles": ["counter-generator", "critic"]
+      "roles": [
+        "counter-generator",
+        "critic"
+      ]
     }
   },
-
   "auxiliary": {
     "groq": {
       "model": "llama-3.1-70b-versatile",
-      "roles": ["aux-critic", "verifier", "router"]
+      "roles": [
+        "aux-critic",
+        "verifier",
+        "router"
+      ]
     },
     "together": {
       "model": "deepseek-ai/DeepSeek-V3",
-      "roles": ["aux-critic", "verifier"]
+      "roles": [
+        "aux-critic",
+        "verifier"
+      ]
     },
     "openrouter": {
       "model": "meta-llama/llama-3.1-70b-instruct:free",
-      "roles": ["aux-critic"]
+      "roles": [
+        "aux-critic"
+      ]
     }
   },
-
   "debate": {
     "threshold": 8.0,
     "max_rounds": 10,
@@ -37,14 +50,56 @@
     "parallel_critics": true,
     "aux_as_tiebreaker": true
   },
-
   "scoring": {
-    "categories": ["accuracy", "completeness", "edge_cases", "practicality"],
-    "weights": [0.3, 0.25, 0.2, 0.25],
-    "core_weight": 0.8,
-    "aux_weight": 0.2
+    "categories": [
+      "accuracy",
+      "completeness",
+      "edge_cases",
+      "practicality"
+    ],
+    "weights": [
+      0.3,
+      0.25,
+      0.2,
+      0.25
+    ],
+    "core_weight": 0.6,
+    "aux_weight": 0.4,
+    "per_critic_weights": {
+      "codex": {
+        "reliability": 0.5192312400331053,
+        "weight": 1.0192312400331054,
+        "reviews": 142,
+        "avg_delta": 1.6598591549295776
+      },
+      "gemini": {
+        "reliability": 0.40442909871840027,
+        "weight": 0.9044290987184003,
+        "reviews": 185,
+        "avg_delta": 2.1
+      },
+      "claude": {
+        "reliability": 0.5157334400854188,
+        "weight": 1.0157334400854188,
+        "reviews": 5,
+        "avg_delta": 1.26
+      },
+      "groq": {
+        "reliability": 0.332283595866004,
+        "weight": 0.832283595866004,
+        "reviews": 34,
+        "avg_delta": 3.123529411764706
+      },
+      "deepseek": {
+        "reliability": 0.32530198904968066,
+        "weight": 0.8253019890496807,
+        "reviews": 51,
+        "avg_delta": 2.898039215686275
+      }
+    },
+    "last_tuned": "2026-03-28T15:09:08.975214",
+    "total_reviews": 417
   },
-
   "adaptive": {
     "enabled": true,
     "default_mode": "standard",
@@ -52,7 +107,6 @@
     "confidence_threshold": 0.6,
     "revision_hard_cap": 2
   },
-
   "adaptive_horcrux": {
     "timeouts": {
       "generator_ms": 30000,
@@ -74,7 +128,6 @@
       "min_progress_delta": 0.05
     }
   },
-
   "timeouts": {
     "round_1": 180,
     "round_2": 300,
@@ -82,7 +135,6 @@
     "default": 300,
     "aux_api": 60
   },
-
   "context": {
     "max_prompt_chars": 16000,
     "truncate_strategy": "head_tail",

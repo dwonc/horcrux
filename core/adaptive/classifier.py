@@ -41,6 +41,7 @@ class InternalEngine(str, Enum):
     PLANNING_PIPELINE = "planning_pipeline"
     PAIR_GENERATION   = "pair_generation"
     SELF_IMPROVE      = "self_improve"
+    DEEP_REFACTOR     = "deep_refactor"
 
 
 class DetectedIntent(str, Enum):
@@ -52,6 +53,7 @@ class DetectedIntent(str, Enum):
     ARTIFACT      = "artifact"
     PARALLEL_GEN  = "parallel_gen"
     SELF_IMPROVE  = "self_improve"
+    DEEP_REFACTOR = "deep_refactor"
 
 
 class RoutingSource(str, Enum):
@@ -415,7 +417,7 @@ def classify_task_complexity(
     # intent 감지 (항상 수행)
     detected_intent, intent_score = _detect_intent(task_description, artifact_type)
 
-    # ① Override — parallel은 별도 처리
+    # ① Override — parallel / deep_refactor는 별도 처리
     if user_mode_override and cfg.routing.enable_mode_override:
         if user_mode_override == "parallel":
             return ClassificationResult(
@@ -425,6 +427,15 @@ def classify_task_complexity(
                 confidence=1.0,
                 internal_engine=InternalEngine.PAIR_GENERATION,
                 detected_intent=detected_intent,
+            )
+        if user_mode_override == "deep_refactor":
+            return ClassificationResult(
+                recommended_mode=HorcruxMode.FULL_HORCRUX,
+                routing_source=RoutingSource.OVERRIDE,
+                reason="user override → deep_refactor",
+                confidence=1.0,
+                internal_engine=InternalEngine.DEEP_REFACTOR,
+                detected_intent=DetectedIntent.DEEP_REFACTOR,
             )
         try:
             mode = HorcruxMode(user_mode_override)

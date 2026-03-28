@@ -34,6 +34,7 @@
 | **Standard** | 중간 복잡도, pair gen + critic | 노랑 |
 | **Full** | 고난도, 풀체인 + aux critic | 빨강 |
 | **Parallel** | 비판 없이 2~3 AI 병렬 생성 | 파랑 |
+| **Deep Refactor** | 멀티모델 코드 분석 + 자동 모듈 분할 | — |
 
 ### 내부 엔진 (자동 결정)
 | 엔진 | 용도 |
@@ -45,6 +46,7 @@
 | `planning_pipeline` | 3 AI gen → synth → critic → polish (brainstorm/artifact) |
 | `pair_generation` | 2~3 AI 병렬 코드 생성 |
 | `self_improve` | 반복 개선 루프 |
+| `deep_refactor` | 모듈별 3모델 분석 → 종합 → 5모델 크리틱 루프 |
 
 ### Intent 자동 감지
 | Intent | 키워드 예시 | → 엔진 |
@@ -56,6 +58,7 @@
 | artifact | ppt, pdf, 보고서, 포트폴리오 | planning_pipeline |
 | parallel_gen | 병렬, parallel, 동시에, 나눠서 | pair_generation |
 | self_improve | 개선, improve, 반복, 다듬어 | self_improve |
+| deep_refactor | mode=deep_refactor 명시 시 | deep_refactor |
 
 ### 핵심 원칙
 - Generator ≠ Critic ≠ Synthesizer — 자기확증 편향 구조적 제거
@@ -161,7 +164,7 @@ python server.py          # Web UI → http://localhost:5000
 ## 모드별 사용법
 
 ### Web UI (http://localhost:5000)
-모드 버튼 5개: **Auto** / **Fast** / **Standard** / **Full** / **Parallel**
+모드 버튼 6개: **Auto** / **Fast** / **Standard** / **Full** / **Parallel** / **Deep Refactor**
 
 - **Auto**: 태스크 입력 → Run → 자동 분류 → 최적 엔진 실행
   - 옵션: Scope(auto/small/medium/large), Risk(auto/low/medium/high), Artifact(none/ppt/pdf/doc)
@@ -215,7 +218,7 @@ horcrux --server classify "이 작업 뭘로 돌릴지"
 POST /api/horcrux/run
 {
   "task": "작업 내용 (필수)",
-  "mode": "auto|fast|standard|full|parallel (기본: auto)",
+  "mode": "auto|fast|standard|full|parallel|deep_refactor (기본: auto)",
   "scope": "small|medium|large (선택, auto-detect)",
   "risk": "low|medium|high (선택, auto-detect)",
   "artifact_type": "none|ppt|pdf|doc (선택)",
@@ -311,6 +314,57 @@ POST /api/horcrux/run
 | /api/adaptive/result/{id} | → /api/horcrux/result/{id} |
 | /api/adaptive/stop/{id} | → /api/horcrux/stop/{id} |
 | /api/adaptive/config | → /api/analytics |
+
+
+## Deep Refactor 모드
+
+### 개요
+대형 프로젝트의 코드 리팩토링 분석에 특화된 모드. 프로젝트를 모듈 단위로 자동 분할하여 3개 모델이 독립 분석한 후, 5개 모델이 크리틱-리비전 루프로 검증합니다.
+
+### 파이프라인
+```
+Phase 0: Auto-Split
+  ├─ 작은 프로젝트 (≤50K chars) → 단일 그룹, 분할 없음
+  └─ 큰 프로젝트 → Claude가 file tree 보고 모듈 그룹 자동 분할
+     (fallback: 디렉토리 기반 자동 분할)
+
+Phase 1: 그룹별 × 3모델 병렬 분석
+  - System Architect (Claude) — 아키텍처, 결합도, 응집도
+  - Senior Developer (Codex) — 코드 품질, 중복, 복잡도, 버그
+  - DX Expert (Gemini) — 유지보수성, 테스트 용이성, 가독성
+  예: 4그룹 × 3모델 = 12개 분석 동시 실행
+
+Phase 2: 전체 종합
+  모든 그룹의 모든 분석 → Claude Opus가 1개 통합 플랜
+  크로스 모듈 이슈 (순환 참조, 일관성 없는 패턴 등) 감지
+
+Phase 3: 5모델 크리틱 → 리비전 반복 (max 3라운드)
+  Claude + Codex + Gemini + Groq + DeepSeek
+
+Phase 4: 최종 리팩토링 플랜
+```
+
+### 사용법
+```bash
+# API
+curl -s -X POST http://localhost:5000/api/horcrux/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "전체 코드 리팩토링 분석", "mode": "deep_refactor", "project_dir": "D:/my/project"}'
+
+# 특정 모듈만 분석
+curl -s -X POST http://localhost:5000/api/horcrux/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "인증 모듈 리팩토링", "mode": "deep_refactor", "project_dir": "D:/my/project/src/auth"}'
+```
+
+### Parallel 모드와의 차이
+| | Parallel | Deep Refactor |
+|--|----------|---------------|
+| 목적 | 코드/문서 빠른 생성 | 기존 코드 품질 분석 |
+| 비판 | 없음 | 5모델 크리틱 루프 |
+| 소스코드 읽기 | 안 함 | 전체 프로젝트 정독 |
+| 모듈 분할 | 없음 | 자동 분할 |
+| 적합한 작업 | 독립 문서 병렬 작성, 접근법 비교 | 리팩토링 분석, 코드 리뷰, 아키텍처 평가 |
 
 
 ## Codex Fallback Chain

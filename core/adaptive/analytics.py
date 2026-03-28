@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,26 @@ from .config import get_config
 
 
 LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+
+
+def _guess_critic_model(text: str, model_hint: str = "") -> str:
+    """critic의 모델명을 추정."""
+    combined = (text + " " + model_hint).lower()
+    if "gemini" in combined:
+        return "gemini"
+    if "claude" in combined:
+        return "claude"
+    if "codex" in combined or "gpt" in combined or "openai" in combined:
+        return "codex"
+    if "groq" in combined or "llama" in combined:
+        return "groq"
+    if "deepseek" in combined:
+        return "deepseek"
+    # verifier는 보통 gemini
+    if "verifier" in combined:
+        return "gemini"
+    # critic default는 codex
+    return "codex"
 
 
 # ═══════════════════════════════════════════
@@ -183,16 +204,37 @@ class ModeUsageStats:
         }
 
 
+def _infer_mode(data: dict, filename: str) -> str:
+    """로그 데이터에서 모드를 추론."""
+    mode = data.get("mode", "")
+    if mode:
+        return mode
+    fid = data.get("id", filename)
+    if isinstance(fid, str):
+        if fid.startswith("pair_"):
+            return "parallel"
+        if fid.startswith("plan_"):
+            return "planning"
+        if fid.startswith("si_"):
+            return "self_improve"
+    if data.get("round") is not None or data.get("raw_steps"):
+        status = data.get("status", "")
+        if status == "converged" or data.get("avg_score", 0) >= 7.5:
+            return "full_horcrux"
+        return "standard"
+    return "unknown"
+
+
 def compute_mode_usage_stats(log_dir: Optional[Path] = None) -> Dict[str, ModeUsageStats]:
-    """result 로그에서 모드별 사용/품질/속도 통계 산출."""
+    """모든 로그에서 모드별 사용/품질/속도 통계 산출."""
     d = log_dir or LOG_DIR
     mode_data: Dict[str, List[dict]] = defaultdict(list)
 
-    for f in d.glob("*_result.json"):
+    for f in d.glob("*.json"):
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            mode = data.get("mode", "unknown")
+            mode = _infer_mode(data, f.stem)
             mode_data[mode].append(data)
         except (json.JSONDecodeError, IOError):
             continue
@@ -200,9 +242,9 @@ def compute_mode_usage_stats(log_dir: Optional[Path] = None) -> Dict[str, ModeUs
     results = {}
     for mode, entries in mode_data.items():
         n = len(entries)
-        scores = [e.get("final_score", 0) for e in entries if e.get("final_score")]
+        scores = [e.get("final_score") or e.get("avg_score") or 0 for e in entries if (e.get("final_score") or e.get("avg_score"))]
         latencies = [e.get("total_latency_ms", 0) for e in entries if e.get("total_latency_ms")]
-        converged = sum(1 for e in entries if e.get("converged"))
+        converged = sum(1 for e in entries if e.get("converged") or e.get("status") == "converged")
 
         results[mode] = ModeUsageStats(
             mode=mode,
@@ -339,6 +381,11 @@ def compute_critic_reliability(log_dir: Optional[Path] = None) -> Dict[str, Crit
     """
     critic별 정확도/일관성을 추적하여 신뢰도 점수 산출.
 
+    모든 로그 타입을 읽음:
+    - *_result.json (adaptive): history[].score vs final_score
+    - debate/regular .json: messages[role=critic/verifier].score vs avg_score
+    - plan_*.json: messages[role=critic/verifier].score vs avg_score
+
     - critic score vs final_score 차이가 작을수록 reliable
     - score 분산이 작을수록 consistent
     - reliability_score = 1.0 - normalized(avg_delta + variance)
@@ -346,24 +393,36 @@ def compute_critic_reliability(log_dir: Optional[Path] = None) -> Dict[str, Crit
     d = log_dir or LOG_DIR
     critic_data: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
 
-    for f in d.glob("*_result.json"):
+    for f in d.glob("*.json"):
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            final_score = data.get("final_score", 0)
-            if not final_score:
-                continue
-            for h in data.get("history", []):
+        except (json.JSONDecodeError, IOError):
+            continue
+
+        # 방법 1: adaptive _result.json — history[].score vs final_score
+        final_score = data.get("final_score", 0)
+        if final_score and data.get("history"):
+            for h in data["history"]:
                 critic_text = h.get("critic", "")
                 score = h.get("score", 0)
                 if score > 0:
-                    # model 추정 (critic은 보통 codex)
-                    model = "codex"  # default
-                    if "claude" in critic_text.lower()[:50]:
-                        model = "claude"
+                    model = _guess_critic_model(critic_text, h.get("model", ""))
                     critic_data[model].append((score, final_score))
-        except (json.JSONDecodeError, IOError):
             continue
+
+        # 방법 2: debate/plan/regular — messages[].score vs avg_score
+        avg_score = data.get("avg_score", 0)
+        if avg_score and data.get("messages"):
+            for m in data["messages"]:
+                role = m.get("role", "")
+                score = m.get("score", 0)
+                if score > 0 and role in ("critic", "verifier", "core_critic", "aux_critic"):
+                    model = _guess_critic_model(
+                        m.get("content", "")[:100],
+                        m.get("model", role),
+                    )
+                    critic_data[model].append((score, avg_score))
 
     results = {}
     for model, pairs in critic_data.items():

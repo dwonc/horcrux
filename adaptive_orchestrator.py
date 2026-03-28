@@ -188,6 +188,13 @@ def run_adaptive(
     print(f"  Log: {result_file}")
     print(f"{'='*60}\n")
 
+    # 자동 scoring 가중치 튜닝
+    try:
+        from server import _maybe_auto_tune_scoring
+        _maybe_auto_tune_scoring()
+    except ImportError:
+        pass
+
     return result
 
 

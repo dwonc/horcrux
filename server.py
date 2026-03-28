@@ -27,6 +27,7 @@ if _env_file.exists():
                     os.environ[_k] = _v
 
 from planning_v2 import register_planning_v2_routes
+from deep_refactor import inject_callers as inject_drf_callers, deep_refactors, run_deep_refactor, create_state as create_drf_state
 from flask import Flask, request, jsonify, render_template_string, Response
 
 app = Flask(__name__)
@@ -123,16 +124,23 @@ Produce improved COMPLETE solution addressing every issue.
 Reply JSON only:
 {{"solution":"<complete improved solution>","approach":"<1 sentence>","fixed":["issue1->fix","issue2->fix"],"remaining":["concern1"]}}"""
 
-SPLIT_PROMPT = """You are a task splitter. Do NOT read or analyze any files. Ignore the current directory.
-Split the following task into {num_parts} parallel implementation parts.
+SPLIT_PROMPT = """You are a software architect splitting a task into {num_parts} parallel implementation parts.
+Do NOT read or analyze any files. Ignore the current directory.
 
 Task: {task}
 {extra_context}
 
-Reply with JSON only. No markdown, no explanation, just the JSON object:
-{{"project_name":"<name>","shared_spec":{{"interfaces":"<1 line>","notes":"<1 line>"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences max>"}}]}}"""
+CRITICAL: The shared_spec MUST be detailed enough that each part can be implemented independently without conflicts.
+Include ALL of the following in shared_spec:
+1. "interfaces" — exact class names, method signatures with args/return types, and dataclass/model definitions that cross part boundaries
+2. "imports" — how parts should import from each other (e.g., "from config import settings", not "from config import get_config()")
+3. "conventions" — naming style (snake_case/camelCase), config access pattern (singleton/function), error class naming, file structure
+4. "shared_files" — files that multiple parts depend on, with their EXACT structure (assign ONE part as owner for each shared file)
 
-SPLIT_PROMPT_WITH_ARTIFACT = """Split into {num_parts} parallel parts.
+Reply with JSON only. No markdown, no explanation, just the JSON object:
+{{"project_name":"<name>","shared_spec":{{"interfaces":"class/function signatures that cross boundaries, with type hints","imports":"exact import statements each part must use","conventions":"config pattern, naming, error handling approach","shared_files":"which shared files exist and which part owns them"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences>","owns":"<list of files this part is responsible for>"}}]}}"""
+
+SPLIT_PROMPT_WITH_ARTIFACT = """You are a software architect splitting a task into {num_parts} parallel parts.
 
 Task: {task}
 
@@ -142,8 +150,11 @@ Debate-validated design (score {artifact_score}/10, {artifact_rounds} rounds):
 Key decisions: {key_decisions}
 Remaining concerns: {remaining_concerns}
 
+CRITICAL: The shared_spec MUST define exact interfaces so parts integrate without conflicts.
+Include: class/function signatures with type hints, exact import patterns, config access convention, error class names, and file ownership per part.
+
 Reply JSON only:
-{{"project_name":"<n>","shared_spec":{{"interfaces":"<1 line>","constraints":"<1 line>"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences max>"}}]}}"""
+{{"project_name":"<n>","shared_spec":{{"interfaces":"exact class/function signatures with types","imports":"exact import statements","conventions":"config, naming, error handling patterns","constraints":"from debate decisions"}},"parts":[{{"id":"part1","title":"<5 words>","description":"<2 sentences>","owns":"<files this part writes>"}}]}}"""
 
 PART_PROMPT = """You are an expert developer. Write NEW code from scratch.
 Do NOT read, reference, or check any existing files. Ignore the filesystem entirely.
@@ -153,8 +164,16 @@ Overall task: {task}
 Your part: {part_title}
 Details: {part_description}
 
-Shared spec:
+═══ SHARED SPEC (MUST FOLLOW EXACTLY) ═══
 {shared_spec}
+═══ END SHARED SPEC ═══
+
+RULES:
+1. You MUST use the exact class names, method signatures, and import patterns defined in the shared spec.
+2. Do NOT rename classes, change function signatures, or use a different config access pattern than specified.
+3. If the spec says "from config import settings", use exactly that — not "from config import get_config()".
+4. Only write files assigned to your part. Do NOT write files owned by other parts.
+5. Your code must be immediately compatible with the other parts following the same spec.
 
 {extra_context}
 
@@ -1162,6 +1181,29 @@ def run_debate(debate_id, task, threshold, max_rounds, initial_solution="", clau
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+    if state["status"] in ("converged", "max_rounds", "completed"):
+        _maybe_auto_tune_scoring()
+
+
+# ═══════════════════════════════════════════
+# AUTO SCORING TUNE — 완료 시 자동 가중치 조정
+# ═══════════════════════════════════════════
+_completed_count = 0
+_AUTO_TUNE_INTERVAL = 10  # 10회 완료마다 자동 튜닝
+
+
+def _maybe_auto_tune_scoring():
+    """완료 카운트가 interval에 도달하면 scoring 가중치 자동 튜닝."""
+    global _completed_count
+    _completed_count += 1
+    if _completed_count % _AUTO_TUNE_INTERVAL == 0:
+        try:
+            from core.adaptive.analytics import auto_tune_scoring_weights
+            result = auto_tune_scoring_weights(dry_run=False)
+            print(f"[AUTO-TUNE] scoring weights updated: core={result['core_weight']}, aux={result['aux_weight']} ({result['reason']})")
+        except Exception as e:
+            print(f"[AUTO-TUNE] failed: {e}")
+
 
 # ═══════════════════════════════════════════
 # PAIR MODE
@@ -1331,7 +1373,6 @@ def run_pair(pair_id, task, mode, extra_context="", artifact=None):
         state["status"] = "completed"
 
         # ── 자동 파일 저장 ──
-        # 결과에서 files 배열 파싱 → output_dir 기준으로 저장
         output_dir = state.get("output_dir", "")
         if output_dir:
             _save_pair_files(state["results"], output_dir)
@@ -1346,6 +1387,9 @@ def run_pair(pair_id, task, mode, extra_context="", artifact=None):
     log_file = LOG_DIR / f"{pair_id}.json"
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+    if state["status"] == "completed":
+        _maybe_auto_tune_scoring()
 
 
 # ═══════════════════════════════════════════
@@ -1454,6 +1498,9 @@ def run_self_improve(sid, task, iterations, initial_solution=""):
     log_file = LOG_DIR / f"{sid}.json"
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+    if state["status"] == "completed":
+        _maybe_auto_tune_scoring()
 
 
 # ═══════════════════════════════════════════
@@ -2104,7 +2151,7 @@ function autoGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollH
 document.getElementById("taskInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();startRun()}});
 async function testConnections(){const el=$('testResult');el.innerHTML='Testing...';try{const r=await fetch("/api/test");const d=await r.json();el.innerHTML=Object.entries(d).map(([k,v])=>{const c=v.ok?'#69db7c':'#ff6b6b';return `<div style="color:${c};margin:6px 0;padding:8px;background:${c}11;border:1px solid ${c}33;border-radius:6px"><b>${v.ok?'OK':'FAIL'} ${k} ${v.json?'JSON ok':'no JSON'}</b></div>`}).join('')}catch(e){el.innerHTML=`<span style="color:#ff6b6b">${e.message}</span>`}}
 async function loadThreads(){const r=await fetch("/api/threads");const t=await r.json();const el=$('threadList');if(!t.length){el.innerHTML='<div style="padding:20px;text-align:center;color:#444;font-size:12px">No tasks yet</div>';return}el.innerHTML=t.map(t=>{const a=t.id===cid?'active':'';const sc=t.avg_score>=THRESHOLD?'#69db7c':t.avg_score>0?'#ff6b6b':'#666';const tm=t.created_at?new Date(t.created_at).toLocaleString('ko-KR',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';return `<div class="thread-item ${a}" onclick="selectThread('${t.id}')"><div class="thread-task">${esc(t.task)}</div><div class="thread-meta"><span class="thread-status ${t.status}"></span><span>${t.status}</span><span>R${t.round}</span><span class="thread-score" style="color:${sc}">${t.avg_score>0?t.avg_score.toFixed(1):'-'}</span><span style="margin-left:auto;color:#555">${tm}</span><span class="thread-delete" onclick="event.stopPropagation();deleteThread('${t.id}')">x</span></div></div>`}).join('')}
-function statusUrl(id){if(id.startsWith('plan_'))return`/api/planning/status/${id}`;if(id.startsWith('pair_'))return`/api/pair/status/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/status/${id}`;if(id.startsWith('si_'))return`/api/self_improve/status/${id}`;if(id.startsWith('hrx_'))return`/api/horcrux/status/${id}`;if(id.startsWith('adp_'))return`/api/horcrux/status/${id}`;return`/api/status/${id}`}
+function statusUrl(id){if(id.startsWith('plan_'))return`/api/planning/status/${id}`;if(id.startsWith('pair_'))return`/api/pair/status/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/status/${id}`;if(id.startsWith('si_'))return`/api/self_improve/status/${id}`;if(id.startsWith('drf_'))return`/api/horcrux/status/${id}`;if(id.startsWith('hrx_'))return`/api/horcrux/status/${id}`;if(id.startsWith('adp_'))return`/api/horcrux/status/${id}`;return`/api/status/${id}`}
 function resultUrl(id){if(id.startsWith('plan_'))return`/api/planning/result/${id}`;if(id.startsWith('pair_'))return`/api/pair/result/${id}`;if(id.startsWith('dp_'))return`/api/pipeline/result/${id}`;if(id.startsWith('si_'))return`/api/self_improve/result/${id}`;if(id.startsWith('hrx_'))return`/api/horcrux/result/${id}`;if(id.startsWith('adp_'))return`/api/horcrux/result/${id}`;return`/api/result/${id}`}
 async function selectThread(id){if(pt)clearInterval(pt);cid=id;lmc=0;$('messages').innerHTML='';$('resultArea').innerHTML='';$('emptyState').style.display='none';
   const isP=id.startsWith('plan_');const isPair=id.startsWith('pair_');const isHrx=id.startsWith('hrx_')||id.startsWith('adp_');setMode(isP||isHrx?'auto':isPair?'parallel':'auto');
@@ -2371,6 +2418,34 @@ def horcrux_run():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    # ── 비동기 엔진: deep_refactor (직접 호출) ──
+    if engine == "deep_refactor":
+        try:
+            project_dir = data.get("project_dir", "")
+            if not project_dir:
+                return jsonify({"error": "project_dir is required for deep_refactor mode"}), 400
+            drf_id = "drf_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:23]
+            claude_model_resolved = data.get("claude_model", "opus")
+            threshold = data.get("threshold", 7.5)
+            max_rounds = data.get("max_rounds", 3)
+            create_drf_state(drf_id, task, project_dir)
+            t = threading.Thread(
+                target=run_deep_refactor,
+                args=(drf_id, task, project_dir, claude_model_resolved, threshold, max_rounds),
+                daemon=True,
+            )
+            t.start()
+            return jsonify({
+                "status": "running",
+                "job_id": drf_id,
+                "internal_engine": engine,
+                "mode": "deep_refactor",
+                "message": "Use check(job_id) to monitor",
+                "routing": {"source": classification.routing_source.value, "confidence": classification.confidence, "intent": intent},
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     # ── 비동기 엔진: debate_loop (직접 호출) ──
     if engine == "debate_loop":
         try:
@@ -2407,7 +2482,10 @@ def horcrux_run():
 @app.route("/api/horcrux/status/<job_id>")
 def horcrux_status(job_id):
     """통합 상태 확인 — job_id prefix 기반 라우팅."""
-    state = horcrux_states.get(job_id)
+    # deep_refactor 상태는 별도 dict
+    state = deep_refactors.get(job_id) if job_id.startswith("drf_") else None
+    if not state:
+        state = horcrux_states.get(job_id)
     if not state:
         log_file = LOG_DIR / f"{job_id}.json"
         if log_file.exists():
@@ -2428,7 +2506,9 @@ def horcrux_status(job_id):
 
 @app.route("/api/horcrux/result/<job_id>")
 def horcrux_result(job_id):
-    state = horcrux_states.get(job_id)
+    state = deep_refactors.get(job_id) if job_id.startswith("drf_") else None
+    if not state:
+        state = horcrux_states.get(job_id)
     if not state:
         log_file = LOG_DIR / f"{job_id}.json"
         if log_file.exists():
@@ -2597,9 +2677,17 @@ def analytics_scoring_apply():
 
 
 if __name__ == "__main__":
+    # Deep Refactor 의존성 주입
+    inject_drf_callers(
+        call_claude=call_claude, call_codex=call_codex, call_gemini=call_gemini,
+        call_aux_critic_fn=_call_aux_critic, aux_endpoints=AUX_CRITIC_ENDPOINTS,
+        extract_json_fn=extract_json, extract_score_fn=extract_score,
+        log_dir=str(LOG_DIR),
+    )
+
     print("\nHorcrux v8 — Adaptive Single Entry Point")
-    print("  External: Auto / Fast / Standard / Full / Parallel")
-    print("  Internal: adaptive_fast/standard/full, debate_loop, planning_pipeline, pair_generation, self_improve")
+    print("  External: Auto / Fast / Standard / Full / Parallel / Deep Refactor")
+    print("  Internal: adaptive_fast/standard/full, debate_loop, planning_pipeline, pair_generation, self_improve, deep_refactor")
     print("  Unified endpoint: /api/horcrux/run → classify → auto-route")
     print()
     # Aux API 키 감지 로그
