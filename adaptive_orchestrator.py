@@ -181,7 +181,7 @@ def run_adaptive(
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"  {'DONE ✅' if result.get('converged') else 'COMPLETED ⚠️'}")
+    print(f"  {'DONE [OK]' if result.get('converged') else 'COMPLETED [!]'}")
     print(f"  Mode: {mode.value} | Rounds: {result.get('rounds', 0)}")
     print(f"  Score: {result.get('final_score', 0)}")
     print(f"  Total: {total_ms:.0f}ms")
@@ -333,7 +333,7 @@ def _run_fast(
                     print(f"      → Revised")
                 break
     else:
-        print(f"  [FAST] No blocker — skipping revision")
+        print(f"  [FAST] No blocker - skipping revision")
 
     _log_round(session_id, 1, round_data)
     history.append(round_data)
@@ -519,7 +519,7 @@ def _run_standard(
 
         # ═══ Convergence Check ═══
         if critic_score >= threshold:
-            print(f"    ✅ CONVERGED ({critic_score} >= {threshold})")
+            print(f"    [CONVERGED] ({critic_score} >= {threshold})")
             round_data["converged"] = True
             history.append(round_data)
             _log_round(session_id, round_num, round_data)
@@ -548,7 +548,7 @@ def _run_standard(
                 i_session.pause(reason=auto_reason)
 
             if not i_session.check_pause_point(f"after_critic_round_{round_num}"):
-                print(f"    ⛔ Session cancelled")
+                print(f"    [CANCELLED] Session cancelled")
                 break
 
             # resume 후 human directive 반영
@@ -577,7 +577,7 @@ def _run_standard(
         _log_round(session_id, round_num, round_data)
 
         if not revision_decision.should_continue:
-            print(f"    ⛔ Stopping: {revision_decision.reason}")
+            print(f"    [STOP] Stopping: {revision_decision.reason}")
             break
 
         prev_score = critic_score
@@ -636,7 +636,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Horcrux v8 — Adaptive Multi-AI Orchestration CLI",
+        description="Horcrux v8 - Adaptive Multi-AI Orchestration CLI",
         epilog="""Examples:
   python adaptive_orchestrator.py "fix typo in README"
   python adaptive_orchestrator.py --mode fast "simple bug fix"
@@ -758,7 +758,7 @@ def main():
     mode = result.get("mode", "?")
     score = result.get("final_score", 0)
     converged = result.get("converged", False)
-    print(f"\n[{mode}] {'CONVERGED' if converged else 'COMPLETED'} — Score: {score}/10\n")
+    print(f"\n[{mode}] {'CONVERGED' if converged else 'COMPLETED'} - Score: {score}/10\n")
 
     if result.get("final_solution"):
         print(result["final_solution"])
