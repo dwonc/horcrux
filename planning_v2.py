@@ -1414,9 +1414,12 @@ def register_planning_v2_routes(app):
         if not state:
             log_file = srv.LOG_DIR / f"{planning_id}.json"
             if log_file.exists():
-                with open(log_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                plannings[planning_id] = state
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                    plannings[planning_id] = state
+                except (json.JSONDecodeError, ValueError):
+                    return jsonify({"error": "not found"}), 404
             else:
                 return jsonify({"error": "not found"}), 404
         # timing 계산 (running일 때만)
@@ -1446,9 +1449,12 @@ def register_planning_v2_routes(app):
         if not state:
             log_file = srv.LOG_DIR / f"{planning_id}.json"
             if log_file.exists():
-                with open(log_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                plannings[planning_id] = state
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                    plannings[planning_id] = state
+                except (json.JSONDecodeError, ValueError):
+                    return jsonify({"error": "not found"}), 404
             else:
                 return jsonify({"error": "not found"}), 404
         return jsonify(state)
