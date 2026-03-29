@@ -41,10 +41,10 @@ LOG_DIR.mkdir(exist_ok=True)
 
 # --- Gemini model fallback ---
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-1.5-flash",
+    "gemini-3-flash-preview",  # 3세대 (1순위)
+    "gemini-2.5-flash",        # 폴백
+    "gemini-2.5-pro",          # 폴백
+    "gemini-2.0-flash",        # 폴백
 ]
 _gemini_current_model_idx = 0
 _gemini_lock = threading.Lock()
@@ -603,8 +603,9 @@ def _win(name: str) -> str:
     return f"{_NPM}\\{name}.cmd"
 
 
-def call_claude(prompt: str, timeout: int = 900, model: str = "", _retry: int = 0) -> str:
-    """Claude CLI - stdin 방식. model 파라미터로 Opus/Sonnet 전환. overloaded 시 1회 재시도."""
+def call_claude(prompt: str, timeout: int = 900, model: str = "claude-sonnet-4-6", _retry: int = 0) -> str:
+    """Claude CLI - stdin 방식. model 파라미터로 Opus/Sonnet 전환. overloaded 시 1회 재시도.
+    기본값: Sonnet (실험 결과: full 모드에서 Opus와 동등, 비용 1/10)"""
     import tempfile
     prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
     try:
@@ -757,7 +758,8 @@ def call_codex(prompt: str, timeout: int = 600) -> str:
 
 def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
     """Gemini 호출. API 키 있으면 API(max_output_tokens 제어), 없으면 CLI fallback."""
-    if model not in GEMINI_MODELS:
+    _all_gemini = set(GEMINI_MODELS) | set(GEMINI_FAST_MODELS)
+    if model not in _all_gemini:
         return "[ERROR] Invalid Gemini model", "error"
 
     prompt = _truncate_prompt(prompt, MAX_PROMPT_CHARS)
@@ -777,6 +779,13 @@ def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
             }, timeout=timeout)
             if resp.status_code == 429:
                 return None, "quota"
+            if resp.status_code == 503:
+                # 서비스 불가 (과부하/deprecation) → 다음 모델로 폴백
+                return None, "quota"
+            if resp.status_code == 404:
+                # 모델 삭제됨 (deprecation) → 다음 모델로 폴백
+                print(f"  [WARN] Gemini model {model} deprecated (404)")
+                return None, "quota"
             if resp.status_code == 200:
                 data = resp.json()
                 candidates = data.get("candidates", [])
@@ -785,7 +794,8 @@ def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
                     text = "".join(p.get("text", "") for p in parts).strip()
                     if text:
                         return text, "ok"
-                return "[ERROR] Gemini API empty response", "error"
+                # empty response → 다음 모델로 폴백
+                return None, "quota"
             else:
                 err_text = resp.text[:300]
                 if "quota" in err_text.lower() or "exhausted" in err_text.lower():
@@ -813,7 +823,9 @@ def _call_gemini_with_model(prompt: str, model: str, timeout: int = 300):
                 return None, "quota"
             if r.returncode != 0 and not out:
                 return f"[ERROR] Gemini/{model}: {stderr[:300]}", "error"
-            return (out or f"[ERROR] Gemini/{model} empty"), "ok"
+            if not out:
+                return None, "quota"  # empty → 다음 모델로 폴백
+            return out, "ok"
         except subprocess.TimeoutExpired:
             return "[TIMEOUT]", "timeout"
         except FileNotFoundError:
@@ -846,6 +858,30 @@ def call_gemini(prompt: str, timeout: int = 300) -> str:
                 _gemini_current_model_idx = idx
         return result
     return "[ERROR] Gemini: all models exhausted"
+
+
+# --- Gemini Fast mode (3.1 Flash-Lite) ---
+GEMINI_FAST_MODELS = [
+    "gemini-3.1-flash-lite-preview",  # 3세대 fast 전용
+    "gemini-2.0-flash-lite",          # 폴백
+]
+
+def call_gemini_fast(prompt: str, timeout: int = 60) -> str:
+    """Fast 모드 전용 Gemini critic. Flash-Lite 우선, 실패 시 일반 모델로 폴백."""
+    # 1차: Flash-Lite 계열
+    for model in GEMINI_FAST_MODELS:
+        result, status = _call_gemini_with_model(prompt, model, timeout)
+        if status == "quota":
+            continue
+        if status == "ok":
+            return result
+    # 2차: 일반 Gemini 모델로 크로스 폴백
+    for model in GEMINI_MODELS:
+        result, status = _call_gemini_with_model(prompt, model, timeout)
+        if status == "quota":
+            continue
+        return result
+    return "[ERROR] Gemini Fast: all models exhausted"
 
 
 # ═══════════════════════════════════════════
