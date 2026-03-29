@@ -18,6 +18,7 @@ adaptive_orchestrator.py — Adaptive Horcrux Orchestrator
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -26,10 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Windows cp949 콘솔에서 유니코드 출력 크래시 방지
-if sys.platform == "win32":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 # core/adaptive/ 패키지에서 import
 from core.adaptive import (
