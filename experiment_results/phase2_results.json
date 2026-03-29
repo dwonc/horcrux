@@ -1,0 +1,122 @@
+[
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "opus",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 17627,
+    "latency_s": 661.3
+  },
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 7.2,
+    "rounds": 2,
+    "solution_length": 7516,
+    "latency_s": 548.7
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "opus",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 12895,
+    "latency_s": 772.1
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 8.5,
+    "rounds": 2,
+    "solution_length": 11240,
+    "latency_s": 433.8
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "opus",
+    "mode": "full",
+    "score": 8.2,
+    "rounds": 2,
+    "solution_length": 8198,
+    "latency_s": 691.1
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 5350,
+    "latency_s": 813.2
+  },
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 12531,
+    "latency_s": 619.1
+  },
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "opus",
+    "mode": "standard",
+    "score": 5.5,
+    "rounds": 2,
+    "solution_length": 6219,
+    "latency_s": 275.3
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 14983,
+    "latency_s": 780.6
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "opus",
+    "mode": "standard",
+    "score": 5.5,
+    "rounds": 2,
+    "solution_length": 2883,
+    "latency_s": 229.3
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "sonnet",
+    "mode": "full",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 12111,
+    "latency_s": 671.9
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "opus",
+    "mode": "standard",
+    "score": 8.5,
+    "rounds": 1,
+    "solution_length": 4297,
+    "latency_s": 171.9
+  }
+]

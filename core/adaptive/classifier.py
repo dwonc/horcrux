@@ -201,7 +201,12 @@ def _route_intent_to_engine(
 ) -> Tuple[HorcruxMode, InternalEngine]:
     """
     detected_intent + mode → (final_mode, internal_engine) 매핑.
-    스펙의 routing_rules 구현.
+
+    실험 데이터 기반 최적화 (2026-03-29):
+      - standard(6.5) vs full(7.7) → full이 +1.2 우위
+      - Sonnet+full(7.5) > Opus+standard(6.5) → 모드가 모델보다 중요
+      - 정책: auto 모드에서 standard 대신 full을 기본으로 사용
+      - fast는 간단한 code_fix에만 유지
     """
     # parallel intent → pair_generation
     if intent == DetectedIntent.PARALLEL_GEN:
@@ -211,40 +216,33 @@ def _route_intent_to_engine(
     if intent == DetectedIntent.SELF_IMPROVE:
         return (HorcruxMode.STANDARD, InternalEngine.SELF_IMPROVE)
 
-    # brainstorm intent
+    # brainstorm intent → planning_pipeline
     if intent == DetectedIntent.BRAINSTORM:
-        if artifact_type in _ARTIFACT_FULL_TYPES:
-            return (HorcruxMode.FULL, InternalEngine.PLANNING_PIPELINE)
-        return (HorcruxMode.STANDARD, InternalEngine.PLANNING_PIPELINE)
+        return (HorcruxMode.FULL, InternalEngine.PLANNING_PIPELINE)
 
-    # artifact intent (ppt, pdf, doc)
+    # artifact intent (ppt, pdf, doc) → planning_pipeline
     if intent in (DetectedIntent.ARTIFACT, DetectedIntent.DOCUMENT):
-        if artifact_type in _ARTIFACT_FULL_TYPES:
-            return (HorcruxMode.FULL, InternalEngine.PLANNING_PIPELINE)
-        return (HorcruxMode.STANDARD, InternalEngine.PLANNING_PIPELINE)
+        return (HorcruxMode.FULL, InternalEngine.PLANNING_PIPELINE)
 
     # refactor/architecture → adaptive_full
     if intent == DetectedIntent.REFACTOR:
         return (HorcruxMode.FULL, InternalEngine.ADAPTIVE_FULL)
 
-    # code_fix + small → adaptive_fast
+    # code_fix + small + low risk → adaptive_fast (간단한 수정만)
     if intent == DetectedIntent.CODE_FIX:
-        if mode in (HorcruxMode.FAST,) or estimated_scope == "small":
+        if mode in (HorcruxMode.FAST,) or (estimated_scope == "small" and risk_level == "low"):
             return (HorcruxMode.FAST, InternalEngine.ADAPTIVE_FAST)
-        return (HorcruxMode.STANDARD, InternalEngine.ADAPTIVE_STANDARD)
+        # 복잡한 code_fix → full (실험: standard 5.5 vs full 7.5)
+        return (HorcruxMode.FULL, InternalEngine.ADAPTIVE_FULL)
 
-    # feature_add → adaptive_standard
+    # feature_add → adaptive_full (실험: standard 5.5 vs full 7.5)
     if intent == DetectedIntent.FEATURE_ADD:
-        engine_map = {
-            HorcruxMode.FAST: InternalEngine.ADAPTIVE_FAST,
-            HorcruxMode.STANDARD: InternalEngine.ADAPTIVE_STANDARD,
-            HorcruxMode.FULL_HORCRUX: InternalEngine.ADAPTIVE_FULL,
-            HorcruxMode.FULL: InternalEngine.ADAPTIVE_FULL,
-        }
-        return (mode, engine_map.get(mode, InternalEngine.ADAPTIVE_STANDARD))
+        if mode == HorcruxMode.FAST:
+            return (HorcruxMode.FAST, InternalEngine.ADAPTIVE_FAST)
+        return (HorcruxMode.FULL, InternalEngine.ADAPTIVE_FULL)
 
-    # fallback
-    return (mode, InternalEngine.ADAPTIVE_STANDARD)
+    # fallback → full (실험 데이터: full이 항상 우위)
+    return (HorcruxMode.FULL, InternalEngine.ADAPTIVE_FULL)
 
 
 def _heuristic_classify(
