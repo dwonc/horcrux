@@ -1,0 +1,16 @@
+{
+  "task_id": "T03",
+  "model": "sonnet",
+  "engine": "planning_pipeline",
+  "job_id": "plan_20260329_150109_513448",
+  "final_score": 0,
+  "rounds": 0,
+  "converged": false,
+  "solution_length": 0,
+  "latency_seconds": 609.1,
+  "messages": [],
+  "status": "",
+  "critic_scores": [],
+  "category": "brainstorm",
+  "difficulty": "medium"
+}

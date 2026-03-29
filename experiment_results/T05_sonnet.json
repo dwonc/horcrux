@@ -1,0 +1,9 @@
+{
+  "task_id": "T05",
+  "difficulty": "hard",
+  "model": "sonnet",
+  "score": 5.0,
+  "rounds": 2,
+  "solution_length": 2505,
+  "latency_s": 96.4
+}

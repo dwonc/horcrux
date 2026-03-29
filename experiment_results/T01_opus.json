@@ -1,0 +1,9 @@
+{
+  "task_id": "T01",
+  "difficulty": "medium",
+  "model": "opus",
+  "score": 6.5,
+  "rounds": 2,
+  "solution_length": 5535,
+  "latency_s": 160.1
+}

@@ -1,0 +1,16 @@
+{
+  "task_id": "T02",
+  "model": "opus",
+  "engine": "planning_pipeline",
+  "job_id": "plan_20260329_144037_040966",
+  "final_score": 0,
+  "rounds": 0,
+  "converged": false,
+  "solution_length": 0,
+  "latency_seconds": 606.9,
+  "messages": [],
+  "status": "",
+  "critic_scores": [],
+  "category": "architecture_design",
+  "difficulty": "hard"
+}

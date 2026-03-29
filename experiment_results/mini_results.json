@@ -1,0 +1,56 @@
+[
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "opus",
+    "score": 7.5,
+    "rounds": 2,
+    "solution_length": 5633,
+    "latency_s": 263.3
+  },
+  {
+    "task_id": "T06",
+    "difficulty": "easy",
+    "model": "sonnet",
+    "score": 4.0,
+    "rounds": 2,
+    "solution_length": 4247,
+    "latency_s": 205.4
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "opus",
+    "score": 6.5,
+    "rounds": 2,
+    "solution_length": 5535,
+    "latency_s": 160.1
+  },
+  {
+    "task_id": "T01",
+    "difficulty": "medium",
+    "model": "sonnet",
+    "score": 5.5,
+    "rounds": 2,
+    "solution_length": 6370,
+    "latency_s": 177.7
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "opus",
+    "score": 5.5,
+    "rounds": 2,
+    "solution_length": 2102,
+    "latency_s": 153.0
+  },
+  {
+    "task_id": "T05",
+    "difficulty": "hard",
+    "model": "sonnet",
+    "score": 5.0,
+    "rounds": 2,
+    "solution_length": 2505,
+    "latency_s": 96.4
+  }
+]

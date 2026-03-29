@@ -1,0 +1,16 @@
+{
+  "task_id": "T04",
+  "model": "sonnet",
+  "engine": "adaptive_standard",
+  "job_id": "hrx_20260329_150900",
+  "final_score": 0,
+  "rounds": 1,
+  "converged": true,
+  "solution_length": 0,
+  "latency_seconds": 126.3,
+  "messages": [],
+  "status": "completed",
+  "critic_scores": [],
+  "category": "document",
+  "difficulty": "medium"
+}
