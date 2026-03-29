@@ -252,8 +252,8 @@ def _run_fast(
 
     print(f"      → {len(gen_text)} chars")
 
-    # ═══ Light Critic ═══
-    print(f"  [FAST] Light Critic (Codex)...")
+    # ═══ Light Critic (Codex + Gemini Flash-Lite 병렬) ═══
+    print(f"  [FAST] Light Critic (Codex + Gemini Flash-Lite)...")
     codex = core["codex"]
     light_critic_prompt = (
         f"Quickly review this solution. Answer ONLY:\n"
@@ -264,12 +264,26 @@ def _run_fast(
     )
 
     light_timeout_ms = adaptive_cfg.timeouts.light_critic_ms
+
+    # Gemini Flash-Lite 병렬 호출 (server.py의 call_gemini_fast 사용)
+    from server import call_gemini_fast
+    import concurrent.futures
+
+    def _gemini_fast_light_critic():
+        raw = call_gemini_fast(light_critic_prompt, timeout=light_timeout_ms // 1000)
+        return ProviderResponse(
+            text=raw, provider="gemini", backend="api", model="gemini-flash-lite",
+        )
+
     critic_result = run_with_timeout_budget(
         stage_name="light_critic",
-        tasks=[("codex", lambda: codex.invoke(
-            light_critic_prompt,
-            timeout=light_timeout_ms // 1000,
-        ))],
+        tasks=[
+            ("codex", lambda: codex.invoke(
+                light_critic_prompt,
+                timeout=light_timeout_ms // 1000,
+            )),
+            ("gemini_fast", _gemini_fast_light_critic),
+        ],
         timeout_budget_ms=light_timeout_ms,
         mode=HorcruxMode.FAST.value,
         session_id=session_id,
@@ -278,16 +292,31 @@ def _run_fast(
     critic_text = ""
     critic_score = 8.0
     has_blocker = False
+    gemini_fast_score = 8.0
+    gemini_fast_blocker = False
 
     for r in critic_result.completed_results:
-        if r.status == StageStatus.COMPLETED and r.result:
-            critic_text = r.result.text if hasattr(r.result, 'text') else str(r.result)
-            critic_score = _parse_score(critic_text)
-            has_blocker = "blocker: yes" in critic_text.lower() or \
-                          "blocker:yes" in critic_text.lower()
-            break
+        if r.status != StageStatus.COMPLETED or not r.result:
+            continue
+        text = r.result.text if hasattr(r.result, 'text') else str(r.result)
+        score = _parse_score(text)
+        blocker = "blocker: yes" in text.lower() or "blocker:yes" in text.lower()
 
-    print(f"      → Score: {critic_score}/10 | Blocker: {'YES' if has_blocker else 'NO'}")
+        if r.task_name == "codex":
+            critic_text = text
+            critic_score = score
+            has_blocker = blocker
+        elif r.task_name == "gemini_fast":
+            gemini_fast_score = score
+            gemini_fast_blocker = blocker
+            print(f"      → Gemini Flash-Lite: {score}/10 | Blocker: {'YES' if blocker else 'NO'}")
+
+    # 보수적 판정: 둘 중 낮은 점수, 하나라도 blocker면 blocker
+    final_critic_score = min(critic_score, gemini_fast_score)
+    has_blocker = has_blocker or gemini_fast_blocker
+
+    print(f"      → Codex: {critic_score}/10 | Combined: {final_critic_score}/10 | Blocker: {'YES' if has_blocker else 'NO'}")
+    critic_score = final_critic_score
 
     round_data = {
         "mode": "fast",
@@ -295,6 +324,7 @@ def _run_fast(
         "critic": critic_text[:500],
         "score": critic_score,
         "blocker": has_blocker,
+        "critic_scores": {"codex": critic_score, "gemini_fast": gemini_fast_score},
     }
 
     # Phase 1.5: update memory from critic

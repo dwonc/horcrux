@@ -21,33 +21,35 @@ Horcrux가 진짜 강한 영역은 **반복적 품질 개선이 필요한 작업
 
 24회 실행 실험(Opus vs Sonnet x standard/full x easy/medium/hard)으로 검증된 결과:
 
-| 조합 | easy | medium | hard | **평균** |
-|------|------|--------|------|---------|
-| Opus+standard | 5.5 | 5.5 | 8.5 | 6.5 |
-| **Opus+full** | **7.5** | 7.5 | **8.2** | **7.7** |
-| Sonnet+standard | 4.0 | 5.5 | 5.0 | 4.8 |
-| **Sonnet+full** | 7.5 | **8.5** | 7.5 | **7.5** |
+| 조합            | easy    | medium  | hard    | **평균** |
+| --------------- | ------- | ------- | ------- | -------- |
+| Opus+standard   | 5.5     | 5.5     | 8.5     | 6.5      |
+| **Opus+full**   | **7.5** | 7.5     | **8.2** | **7.7**  |
+| Sonnet+standard | 4.0     | 5.5     | 5.0     | 4.8      |
+| **Sonnet+full** | 7.5     | **8.5** | 7.5     | **7.5**  |
 
 **핵심 발견:**
+
 - **모델보다 오케스트레이션 깊이가 중요** — Sonnet+full(7.5) > Opus+standard(6.5)
 - **Full 모드에서 Opus/Sonnet 동점** — 평균 7.7 vs 7.5 (차이 0.2)
 - **Sonnet은 비용 1/10에 full 모드로 Opus 동등 품질 달성**
 
 이 데이터를 기반으로:
+
 - **기본 모델: Sonnet** (비용 대비 품질 최적)
 - **기본 모드: Full** (auto 라우팅 시 standard 대신 full)
 - 간단한 수정만 Fast로 라우팅
 
 ### 6 Models, 5 Providers
 
-| # | Model | Provider | Role |
-|---|-------|----------|------|
-| 1 | **Claude Sonnet 4.6** (기본) | Anthropic | Generator, Judge |
-| 2 | **Codex 5.4** | OpenAI | Counter-Generator, Critic |
-| 3 | **Gemini 2.5 Flash** | Google | Core Critic |
-| 4 | **Llama 3.3 70B** | Meta (via Groq) | Aux Critic |
-| 5 | **DeepSeek Chat** | DeepSeek | Aux Critic |
-| 6 | **GPT-OSS 120B** | OpenRouter | Aux Critic |
+| #   | Model                        | Provider        | Role                      |
+| --- | ---------------------------- | --------------- | ------------------------- |
+| 1   | **Claude Sonnet 4.6** (기본) | Anthropic       | Generator, Judge          |
+| 2   | **Codex 5.4**                | OpenAI          | Counter-Generator, Critic |
+| 3   | **Gemini 3.0 Flash**         | Google          | Core Critic               |
+| 4   | **Llama 3.3 70B**            | Meta (via Groq) | Aux Critic                |
+| 5   | **DeepSeek Chat**            | DeepSeek        | Aux Critic                |
+| 6   | **GPT-OSS 120B**             | OpenRouter      | Aux Critic                |
 
 ```
 Sonnet(Generator) -> Codex+Gemini+Llama+DeepSeek+GPT-OSS(5 Critics) -> Codex(Synthesizer)
@@ -70,48 +72,53 @@ start.bat              # 또는 python server.py
 ## Modes
 
 ### Auto (기본) — 실험 데이터 기반 라우팅
+
 ```
 Task -> Classifier -> intent + 난이도 감지 -> Full 또는 Fast 자동 선택
 ```
 
-| 이렇게 말하면 | 이렇게 돌아감 |
-|--------------|-------------|
-| "typo 수정해줘" | fast -> adaptive_fast (30초) |
-| "기능 추가해줘" | **full** -> adaptive_full (10분, 최고 품질) |
-| "리팩토링 플랜" | **full** -> adaptive_full |
-| "브레인스토밍해줘" | **full** -> planning_pipeline |
-| "보안 감사" | **full** -> adaptive_full |
-| "전체 코드 분석" | deep_refactor -> 멀티모델 분석 |
+| 이렇게 말하면      | 이렇게 돌아감                               |
+| ------------------ | ------------------------------------------- |
+| "typo 수정해줘"    | fast -> adaptive_fast (30초)                |
+| "기능 추가해줘"    | **full** -> adaptive_full (10분, 최고 품질) |
+| "리팩토링 플랜"    | **full** -> adaptive_full                   |
+| "브레인스토밍해줘" | **full** -> planning_pipeline               |
+| "보안 감사"        | **full** -> adaptive_full                   |
+| "전체 코드 분석"   | deep_refactor -> 멀티모델 분석              |
 
 ### Fast — 간단한 수정 전용
+
 ```
 Sonnet(1-pass) -> Light Critic -> 결과        20~60초, 평균 5.0/10
 ```
 
 ### Full — 기본 모드 (실험 검증)
+
 ```
 Sonnet+Codex(병렬) -> Synthesizer -> 5 Critics(병렬) -> Revision Loop -> 결과
 평균 7.5/10, 3~10분
 ```
 
 ### Deep Refactor — 코드 리팩토링 분석 특화
+
 ```
 Auto-Split -> 그룹별 x 3모델 분석 -> 종합 -> 5모델 크리틱 루프
 ```
 
 ### Parallel — 독립 작업 병렬 생성
+
 ```
 Architect -> 2~3 AI 병렬 생성 (비판 없음, 순수 속도)
 ```
 
 ## 비용 효율성
 
-| 조합 | 평균 점수 | 예상 비용/회 | 특징 |
-|------|----------|-------------|------|
-| **Sonnet+full (기본)** | **7.5** | **~$0.08** | **최고 가성비** |
-| Opus+full | 7.7 | ~$0.80 | 최고 품질 (차이 미미) |
-| Opus+standard | 6.5 | ~$0.40 | 비효율적 |
-| Sonnet+standard | 4.8 | ~$0.04 | 품질 부족 |
+| 조합                   | 평균 점수 | 예상 비용/회 | 특징                  |
+| ---------------------- | --------- | ------------ | --------------------- |
+| **Sonnet+full (기본)** | **7.5**   | **~$0.08**   | **최고 가성비**       |
+| Opus+full              | 7.7       | ~$0.80       | 최고 품질 (차이 미미) |
+| Opus+standard          | 6.5       | ~$0.40       | 비효율적              |
+| Sonnet+standard        | 4.8       | ~$0.04       | 품질 부족             |
 
 > Opus로 전환: `claude_model=opus` 파라미터 추가
 
@@ -152,11 +159,11 @@ Architect -> 2~3 AI 병렬 생성 (비판 없음, 순수 속도)
 
 ## Subscriptions
 
-| Tier | 구독 | 월 비용 | 권장 |
-|------|------|--------|------|
+| Tier            | 구독                      | 월 비용 | 권장                             |
+| --------------- | ------------------------- | ------- | -------------------------------- |
 | **Recommended** | Claude Pro + ChatGPT Plus | **$40** | **Sonnet+full = Opus 동등 품질** |
-| Maximum | Claude Max + ChatGPT Plus | $120 | Opus+full, 최고 품질 |
-| Minimal | Claude Pro only | $20 | Sonnet + OpenAI API fallback |
+| Maximum         | Claude Max + ChatGPT Plus | $120    | Opus+full, 최고 품질             |
+| Minimal         | Claude Pro only           | $20     | Sonnet + OpenAI API fallback     |
 
 Aux Critics(Groq, DeepSeek, OpenRouter)는 무료 tier로 운영됩니다.
 

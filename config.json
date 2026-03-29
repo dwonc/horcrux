@@ -67,16 +67,16 @@
     "aux_weight": 0.4,
     "per_critic_weights": {
       "codex": {
-        "reliability": 0.5192312400331053,
-        "weight": 1.0192312400331054,
-        "reviews": 142,
-        "avg_delta": 1.6598591549295776
+        "reliability": 0.537314859138687,
+        "weight": 1.0373148591386872,
+        "reviews": 195,
+        "avg_delta": 1.3512820512820514
       },
       "gemini": {
-        "reliability": 0.40442909871840027,
-        "weight": 0.9044290987184003,
-        "reviews": 185,
-        "avg_delta": 2.1
+        "reliability": 0.37343947202965433,
+        "weight": 0.8734394720296543,
+        "reviews": 212,
+        "avg_delta": 2.2150943396226417
       },
       "claude": {
         "reliability": 0.5157334400854188,
@@ -85,20 +85,20 @@
         "avg_delta": 1.26
       },
       "groq": {
-        "reliability": 0.332283595866004,
-        "weight": 0.832283595866004,
-        "reviews": 34,
-        "avg_delta": 3.123529411764706
+        "reliability": 0.3300780402189365,
+        "weight": 0.8300780402189365,
+        "reviews": 61,
+        "avg_delta": 2.3081967213114756
       },
       "deepseek": {
-        "reliability": 0.32530198904968066,
-        "weight": 0.8253019890496807,
-        "reviews": 51,
-        "avg_delta": 2.898039215686275
+        "reliability": 0.34332467532467525,
+        "weight": 0.8433246753246753,
+        "reviews": 77,
+        "avg_delta": 2.1389610389610394
       }
     },
-    "last_tuned": "2026-03-28T15:09:08.975214",
-    "total_reviews": 417
+    "last_tuned": "2026-03-29T22:59:26.840187",
+    "total_reviews": 550
   },
   "adaptive": {
     "enabled": true,

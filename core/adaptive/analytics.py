@@ -29,6 +29,8 @@ LOG_DIR = Path(__file__).parent.parent.parent / "logs"
 def _guess_critic_model(text: str, model_hint: str = "") -> str:
     """critic의 모델명을 추정."""
     combined = (text + " " + model_hint).lower()
+    if "gemini_fast" in combined or "flash-lite" in combined or "flash_lite" in combined:
+        return "gemini_fast"
     if "gemini" in combined:
         return "gemini"
     if "claude" in combined:
@@ -404,11 +406,18 @@ def compute_critic_reliability(log_dir: Optional[Path] = None) -> Dict[str, Crit
         final_score = data.get("final_score", 0)
         if final_score and data.get("history"):
             for h in data["history"]:
-                critic_text = h.get("critic", "")
-                score = h.get("score", 0)
-                if score > 0:
-                    model = _guess_critic_model(critic_text, h.get("model", ""))
-                    critic_data[model].append((score, final_score))
+                # per-critic scores가 있으면 개별 추적 (fast 모드 등)
+                per_scores = h.get("critic_scores", {})
+                if per_scores:
+                    for cname, cscore in per_scores.items():
+                        if cscore and cscore > 0:
+                            critic_data[cname].append((cscore, final_score))
+                else:
+                    critic_text = h.get("critic", "")
+                    score = h.get("score", 0)
+                    if score > 0:
+                        model = _guess_critic_model(critic_text, h.get("model", ""))
+                        critic_data[model].append((score, final_score))
             continue
 
         # 방법 2: debate/plan/regular — messages[].score vs avg_score
@@ -494,7 +503,7 @@ def auto_tune_scoring_weights(
         }
 
     # Core / Aux 분류
-    core_names = {"codex", "gemini", "claude"}
+    core_names = {"codex", "gemini", "gemini_fast", "claude"}
     core_weights = []
     aux_weights = []
     per_critic = {}
